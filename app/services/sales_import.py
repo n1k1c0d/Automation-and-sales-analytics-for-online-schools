@@ -11,7 +11,7 @@ from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.exc import IntegrityError
 
 from app.database.models import Base
-from app.schemas.sales_import import ROW_MODELS
+from app.schemas.sales_import import ROW_MODELS, SOURCE_SYSTEM_PATTERN
 from app.services.sales_import_files import ImportRow, read_import_files
 
 type Outcome = Literal["inserted", "duplicate", "conflict", "invalid"]
@@ -161,7 +161,7 @@ def import_sales_data(
     engine: Engine, path: Path, *, source_system: str, excel_timezone: str | None = None
 ) -> ImportReport:
     source_system = source_system.strip()
-    if not re.fullmatch(r"[a-z0-9_]{1,64}", source_system):
+    if not re.fullmatch(SOURCE_SYSTEM_PATTERN, source_system):
         raise ValueError(
             "source_system must contain 1–64 lowercase ASCII letters, digits or underscores."
         )

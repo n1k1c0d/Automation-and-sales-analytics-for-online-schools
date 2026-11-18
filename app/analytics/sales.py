@@ -1,12 +1,21 @@
 from datetime import UTC, date, datetime, time, timedelta
-from decimal import Decimal
 from pathlib import Path
-from typing import Self
 from uuid import UUID
 from zoneinfo import ZoneInfo
 
-from pydantic import BaseModel, ConfigDict, model_validator
-from sqlalchemy import Connection, text
+from sqlalchemy import Connection, Engine, select, text
+
+from app.database.models import Lead, Manager
+from app.schemas.sales_metrics import ManagerDimension, SalesDimensions
+from app.schemas.sales_report import (
+    DailySalesMetrics,
+    ManagerSalesMetrics,
+    ReportPeriod,
+    SalesMetrics,
+    SalesReport,
+    SalesReportComparison,
+    SourceSalesMetrics,
+)
 
 BUSINESS_ZONE = ZoneInfo("Europe/Moscow")
 REPORT_SQL = text(
@@ -14,58 +23,6 @@ REPORT_SQL = text(
         encoding="utf-8"
     )
 )
-
-
-class ReportPeriod(BaseModel):
-    model_config = ConfigDict(frozen=True)
-
-    start_date: date
-    end_date: date
-    cutoff_date: date
-
-    @model_validator(mode="after")
-    def check_period(self) -> Self:
-        if self.start_date > self.end_date:
-            raise ValueError("start_date must be on or before end_date.")
-        return self
-
-
-class SalesMetrics(BaseModel):
-    leads: int
-    scheduled_lessons: int
-    completed_lessons: int
-    bank_application_leads: int
-    paying_leads: int
-    paid_amount_rub: Decimal
-    average_paid_check_rub: Decimal | None
-    cohort_leads: int
-    cohort_bank_application_leads: int
-    cohort_paying_leads: int
-    lesson_to_bank_application_pct: Decimal | None
-    lesson_to_payment_pct: Decimal | None
-
-
-class DailySalesMetrics(SalesMetrics):
-    day: date
-
-
-class ManagerSalesMetrics(SalesMetrics):
-    manager_id: UUID
-    manager_name: str
-
-
-class SourceSalesMetrics(SalesMetrics):
-    source: str
-
-
-class SalesReport(BaseModel):
-    period: ReportPeriod
-    manager_id: UUID | None
-    source: str | None
-    total: SalesMetrics
-    daily: list[DailySalesMetrics]
-    by_manager: list[ManagerSalesMetrics]
-    by_source: list[SourceSalesMetrics]
 
 
 def _business_midnight(day: date, *, next_day: bool = False) -> datetime:
@@ -120,3 +77,44 @@ def load_sales_report(
             SourceSalesMetrics.model_validate(row) for row in by_grain["source"]
         ],
     )
+
+
+def read_sales_report(
+    engine: Engine,
+    period: ReportPeriod,
+    *,
+    comparison_period: ReportPeriod | None = None,
+    manager_id: UUID | None = None,
+    source: str | None = None,
+) -> SalesReport | SalesReportComparison:
+    with (
+        engine.connect().execution_options(
+            isolation_level="REPEATABLE READ"
+        ) as connection,
+        connection.begin(),
+    ):
+        connection.exec_driver_sql("SET TRANSACTION READ ONLY")
+        current = load_sales_report(
+            connection, period, manager_id=manager_id, source=source
+        )
+        if comparison_period is None:
+            return current
+        comparison = load_sales_report(
+            connection, comparison_period, manager_id=manager_id, source=source
+        )
+        return SalesReportComparison(current=current, comparison=comparison)
+
+
+def read_sales_dimensions(engine: Engine) -> SalesDimensions:
+    with engine.connect() as connection:
+        managers = connection.execute(
+            select(Manager.id, Manager.name).order_by(Manager.name, Manager.id)
+        )
+        manager_options = [
+            ManagerDimension(manager_id=manager_id, manager_name=name)
+            for manager_id, name in managers
+        ]
+        sources = connection.scalars(
+            select(Lead.source).distinct().order_by(Lead.source)
+        ).all()
+    return SalesDimensions(managers=manager_options, sources=list(sources))

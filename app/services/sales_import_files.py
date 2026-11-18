@@ -1,5 +1,6 @@
 import csv
-from collections.abc import Iterator
+from collections.abc import Generator, Iterator
+from contextlib import closing
 from dataclasses import dataclass
 from pathlib import Path
 from xml.etree.ElementTree import ParseError
@@ -67,7 +68,7 @@ def _table_rows(table: str, rows: Iterator[RawRow]) -> list[ImportRow]:
     return items
 
 
-def _csv_rows(path: Path) -> Iterator[RawRow]:
+def _csv_rows(path: Path) -> Generator[RawRow, None, None]:
     with path.open(encoding="utf-8-sig", newline="") as file:
         reader = csv.reader(file, strict=True)
         while True:
@@ -76,6 +77,11 @@ def _csv_rows(path: Path) -> Iterator[RawRow]:
             if row is None:
                 return
             yield number, tuple(row), None
+
+
+def _read_csv(name: str, path: Path) -> list[ImportRow]:
+    with closing(_csv_rows(path)) as rows:
+        return _table_rows(name, rows)
 
 
 def _worksheet_rows(worksheet) -> Iterator[RawRow]:
@@ -92,29 +98,35 @@ def _worksheet_rows(worksheet) -> Iterator[RawRow]:
 
 
 def _read_workbook(path: Path) -> dict[str, list[ImportRow]]:
-    workbook = load_workbook(path, read_only=True, data_only=False, keep_links=False)
-    try:
-        return {
-            name: _table_rows(name, _worksheet_rows(workbook[name]))
-            for name in ROW_MODELS
-            if name in workbook.sheetnames
-        }
-    finally:
-        workbook.close()
+    with path.open("rb") as file:
+        try:
+            workbook = load_workbook(
+                file, read_only=True, data_only=False, keep_links=False
+            )
+        except (OSError, ValueError, TypeError, IndexError) as exc:
+            raise ValueError("Could not read the Excel workbook.") from exc
+        try:
+            return {
+                name: _table_rows(name, _worksheet_rows(workbook[name]))
+                for name in ROW_MODELS
+                if name in workbook.sheetnames
+            }
+        finally:
+            workbook.close()
 
 
 def read_import_files(path: Path) -> dict[str, list[ImportRow]]:
     try:
         if path.is_dir():
             tables = {
-                name: _table_rows(name, _csv_rows(file))
+                name: _read_csv(name, file)
                 for name in ROW_MODELS
                 if (file := path / f"{name}.csv").is_file()
             }
         elif path.suffix.lower() == ".xlsx":
             tables = _read_workbook(path)
         elif path.suffix.lower() == ".csv" and path.stem in ROW_MODELS:
-            tables = {path.stem: _table_rows(path.stem, _csv_rows(path))}
+            tables = {path.stem: _read_csv(path.stem, path)}
         else:
             raise ValueError(
                 "Use a directory of sales CSVs, a named sales CSV, or an .xlsx workbook."

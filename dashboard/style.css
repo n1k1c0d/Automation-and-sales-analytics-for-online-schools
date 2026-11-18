@@ -1,0 +1,58 @@
+.block-container {
+  max-width: 1440px;
+  padding-top: 3.25rem;
+  padding-bottom: 3rem;
+  padding-inline: clamp(1rem, 4vw, 3rem);
+}
+
+[data-testid="stHeader"] {
+  background: transparent;
+}
+
+[data-testid="stSidebar"] [data-testid="stHeading"] h1 {
+  color: #3155cc;
+  font-size: 1.36rem;
+  padding-bottom: 1.15rem;
+}
+
+[data-testid="stSidebar"] [data-testid="stHeading"] h2 {
+  font-size: 1.05rem;
+}
+
+.st-key-headline_cards [data-testid="stMetric"],
+.st-key-trend_panel,
+.st-key-funnel_panel {
+  background: #fff;
+  border-radius: 0.9rem;
+}
+
+[data-testid="stMetricLabel"] p {
+  font-size: 0.88rem;
+  white-space: normal;
+}
+
+[data-testid="stMetricValue"] {
+  font-size: clamp(1.25rem, 2.25vw, 2.1rem);
+  letter-spacing: -0.035em;
+  font-variant-numeric: tabular-nums;
+}
+
+.st-key-funnel_panel [data-testid="stMetricValue"] {
+  font-size: 1.45rem;
+}
+
+@media (max-width: 640px) {
+  .block-container {
+    padding-top: 2.8rem;
+  }
+
+  .st-key-headline_cards [data-testid="stHorizontalBlock"] {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .st-key-headline_cards [data-testid="stColumn"] {
+    min-width: 0;
+    width: 100%;
+  }
+}

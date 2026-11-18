@@ -6,20 +6,23 @@ readme = "README.md"
 requires-python = ">=3.12,<3.13"
 dependencies = [
     "alembic>=1,<2",
+    "altair>=5,<7",
     "defusedxml>=0.7,<1",
     "fastapi",
+    "httpx2",
     "openpyxl>=3.1,<4",
     "psycopg[binary]>=3,<4",
     "pydantic>=2,<3",
     "pydantic-settings>=2,<3",
+    "python-multipart>=0.0.34",
     "sqlalchemy>=2,<3",
+    "streamlit>=1.50,<2",
     "tzdata",
     "uvicorn",
 ]
 
 [dependency-groups]
 dev = [
-    "httpx2",
     "pytest",
     "ruff",
 ]
