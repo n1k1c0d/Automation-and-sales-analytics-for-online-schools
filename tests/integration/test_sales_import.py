@@ -101,21 +101,19 @@ def test_invalid_and_conflicting_rows_do_not_prevent_valid_csv_rows(
     _write_csv(
         tmp_path / "leads.csv",
         LEAD_HEADER,
-        [(LEAD_ROW[0], LEAD_ROW[1], "referral", LEAD_ROW[3], "new")],
+        [(LEAD_ROW[0], LEAD_ROW[1], "referral", LEAD_ROW[3], "won")],
     )
     report = import_sales_data(
         postgres_engine, tmp_path / "leads.csv", source_system="mixed_input"
     )
     assert report.tables["leads"]["conflict"] == 1
     with postgres_engine.connect() as conn:
-        assert (
-            conn.execute(
-                select(Lead.source).where(
-                    Lead.source_system == "mixed_input", Lead.external_id == "0002"
-                )
-            ).scalar_one()
-            == "webinar"
-        )
+        stored = conn.execute(
+            select(Lead.source, Lead.status).where(
+                Lead.source_system == "mixed_input", Lead.external_id == "0002"
+            )
+        ).one()
+        assert tuple(stored) == ("webinar", "new")
 
 
 def test_xlsx_and_csv_reuse_the_same_text_identity(

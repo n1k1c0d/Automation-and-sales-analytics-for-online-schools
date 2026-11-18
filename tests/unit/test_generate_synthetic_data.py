@@ -4,7 +4,13 @@ from pathlib import Path
 
 import pytest
 
-from scripts.generate_synthetic_data import generate_dataset, write_csv_dataset
+from scripts.generate_synthetic_data import (
+    Cell,
+    Dataset,
+    generate_dataset,
+    write_csv_dataset,
+)
+from scripts.synthetic_profiles import ConversionProfile
 
 
 def test_default_dataset_has_unique_keys_and_consistent_events() -> None:
@@ -99,3 +105,75 @@ def test_export_is_repeatable_and_preserves_existing_different_files(
         write_csv_dataset(generate_dataset(lead_count=12, seed=43), first)
 
     assert {path.name: path.read_bytes() for path in first.glob("*.csv")} == before
+
+
+@pytest.mark.parametrize("entry", ["extraneous.csv", "unrelated_folder"])
+def test_existing_export_rejects_extra_entries(tmp_path: Path, entry: str) -> None:
+    output = tmp_path / "sales"
+    dataset = generate_dataset(lead_count=12)
+    write_csv_dataset(dataset, output)
+    extra = output / entry
+    before = (output / "leads.csv").read_bytes()
+    if entry.endswith(".csv"):
+        extra.write_text("Outside the dataset", encoding="utf-8")
+    else:
+        extra.mkdir()
+
+    with pytest.raises(FileExistsError, match="exactly the expected CSV files"):
+        write_csv_dataset(dataset, output)
+
+    assert extra.exists()
+    assert (output / "leads.csv").read_bytes() == before
+
+
+def _funnel_rates(dataset: Dataset, leads: set[Cell]) -> tuple[float, float, float]:
+    completed = {
+        lesson["lead_id"]
+        for lesson in dataset["lessons"]
+        if lesson["status"] == "completed" and lesson["lead_id"] in leads
+    }
+    submitted = {
+        application["lead_id"]
+        for application in dataset["bank_applications"]
+        if application["status"] != "cancelled" and application["lead_id"] in completed
+    }
+    paid = {
+        payment["lead_id"]
+        for payment in dataset["payments"]
+        if payment["status"] == "paid" and payment["lead_id"] in completed
+    }
+    return (
+        len(completed) / len(leads),
+        len(submitted) / len(completed),
+        len(paid) / len(completed),
+    )
+
+
+def test_sample_profile_creates_repeatable_funnel_differences() -> None:
+    path = Path(__file__).resolve().parents[2] / "data/synthetic/profiles/quality.json"
+    profile = ConversionProfile.model_validate_json(path.read_bytes())
+    dataset = generate_dataset(profile=profile)
+    assert dataset == generate_dataset(profile=profile)
+    assert {lead["source_system"] for lead in dataset["leads"]} == {
+        "synthetic_quality_42"
+    }
+
+    for dimension, higher, lower in (
+        ("manager_external_id", "M01", "M08"),
+        ("source", "referral", "paid_search"),
+    ):
+        higher_ids = {row["id"] for row in dataset["leads"] if row[dimension] == higher}
+        lower_ids = {row["id"] for row in dataset["leads"] if row[dimension] == lower}
+        higher_rates = _funnel_rates(dataset, higher_ids)
+        lower_rates = _funnel_rates(dataset, lower_ids)
+        assert all(
+            high > low for high, low in zip(higher_rates, lower_rates, strict=True)
+        )
+
+
+def test_profile_rejects_unknown_manager_and_source_keys() -> None:
+    profile = ConversionProfile.model_validate(
+        {"code": "typos", "managers": {"M99": {}}, "sources": {"unknown_source": {}}}
+    )
+    with pytest.raises(ValueError, match="M99, unknown_source"):
+        generate_dataset(profile=profile)

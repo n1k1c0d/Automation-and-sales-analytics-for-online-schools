@@ -58,3 +58,4 @@ dump_*.sql
 
 # Воспроизводимый вывод генератора
 /data/synthetic/generated/
+/data/synthetic/scenarios/

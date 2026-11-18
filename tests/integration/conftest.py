@@ -12,8 +12,7 @@ from app.core.config import PostgresSettings
 from app.database.connection import create_db_engine
 
 
-@pytest.fixture(scope="session")
-def postgres_engine(request: pytest.FixtureRequest) -> Iterator[Engine]:
+def _migrated_database(request: pytest.FixtureRequest) -> Iterator[Engine]:
     if not request.config.getoption("--integration"):
         pytest.skip("Pass --integration to run PostgreSQL tests.")
 
@@ -37,3 +36,13 @@ def postgres_engine(request: pytest.FixtureRequest) -> Iterator[Engine]:
         engine = create_db_engine(settings.model_copy(update={"db": test_db}))
         cleanup.callback(engine.dispose)
         yield engine
+
+
+@pytest.fixture(scope="session")
+def postgres_engine(request: pytest.FixtureRequest) -> Iterator[Engine]:
+    yield from _migrated_database(request)
+
+
+@pytest.fixture
+def isolated_postgres_engine(request: pytest.FixtureRequest) -> Iterator[Engine]:
+    yield from _migrated_database(request)
