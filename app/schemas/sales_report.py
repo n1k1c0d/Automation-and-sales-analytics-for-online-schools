@@ -4,6 +4,9 @@ from typing import Self
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, model_validator
+from pydantic_core import PydanticCustomError
+
+CUTOFF_BEFORE_PERIOD_END = "cutoff_before_period_end"
 
 
 class ReportPeriod(BaseModel):
@@ -17,6 +20,11 @@ class ReportPeriod(BaseModel):
     def check_period(self) -> Self:
         if self.start_date > self.end_date:
             raise ValueError("start_date must be on or before end_date.")
+        if self.cutoff_date < self.end_date:
+            raise PydanticCustomError(
+                CUTOFF_BEFORE_PERIOD_END,
+                "Cutoff date must be on or after the period end.",
+            )
         return self
 
 

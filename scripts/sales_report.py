@@ -41,8 +41,8 @@ def main() -> int:
                 end_date=end,
                 cutoff_date=args.compare_cutoff_date or end,
             )
-    except ValidationError:
-        parser.error("Each start date must be on or before its end date.")
+    except ValidationError as exc:
+        parser.error(exc.errors()[0]["msg"].removeprefix("Value error, "))
 
     try:
         settings = PostgresSettings()

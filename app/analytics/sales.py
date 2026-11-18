@@ -3,8 +3,10 @@ from pathlib import Path
 from uuid import UUID
 from zoneinfo import ZoneInfo
 
-from sqlalchemy import Connection, Engine, text
+from sqlalchemy import Connection, Engine, select, text
 
+from app.database.models import Lead, Manager
+from app.schemas.sales_metrics import ManagerDimension, SalesDimensions
 from app.schemas.sales_report import (
     DailySalesMetrics,
     ManagerSalesMetrics,
@@ -101,3 +103,18 @@ def read_sales_report(
             connection, comparison_period, manager_id=manager_id, source=source
         )
         return SalesReportComparison(current=current, comparison=comparison)
+
+
+def read_sales_dimensions(engine: Engine) -> SalesDimensions:
+    with engine.connect() as connection:
+        managers = connection.execute(
+            select(Manager.id, Manager.name).order_by(Manager.name, Manager.id)
+        )
+        manager_options = [
+            ManagerDimension(manager_id=manager_id, manager_name=name)
+            for manager_id, name in managers
+        ]
+        sources = connection.scalars(
+            select(Lead.source).distinct().order_by(Lead.source)
+        ).all()
+    return SalesDimensions(managers=manager_options, sources=list(sources))

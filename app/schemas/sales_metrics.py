@@ -78,3 +78,13 @@ class SalesMetricsQuery(BaseModel):
                 cutoff_date=self.compare_cutoff_date or self.compare_end_date,
             )
         return current, comparison
+
+
+class ManagerDimension(BaseModel):
+    manager_id: UUID
+    manager_name: str
+
+
+class SalesDimensions(BaseModel):
+    managers: list[ManagerDimension]
+    sources: list[str]

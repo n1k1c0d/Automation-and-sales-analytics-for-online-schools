@@ -5,9 +5,17 @@ from pathlib import Path
 import streamlit as st
 from pydantic import ValidationError
 
-from app.schemas.sales_metrics import MAX_REPORT_DAYS, SalesMetricsQuery
-from app.schemas.sales_report import SalesReport, SalesReportComparison
-from dashboard.api import DashboardAPIError, get_api_url, get_report
+from app.schemas.sales_metrics import (
+    MAX_REPORT_DAYS,
+    SalesDimensions,
+    SalesMetricsQuery,
+)
+from app.schemas.sales_report import (
+    CUTOFF_BEFORE_PERIOD_END,
+    SalesReport,
+    SalesReportComparison,
+)
+from dashboard.api import DashboardAPIError, get_api_url, get_dimensions, get_report
 from dashboard.views import (
     breakdowns,
     funnel_chart,
@@ -21,9 +29,10 @@ DEMO_PERIOD = (date(2026, 6, 1), date(2026, 8, 31))
 DEMO_CUTOFF = date(2026, 10, 31)
 MIN_DATE = date.min + timedelta(days=1)
 MAX_DATE = date.max - timedelta(days=1)
+CUTOFF_HELP = "Выберите дату не раньше конца периода. Пустое поле использует последний день периода."
 
 
-def _date_input(label: str, value, *, key: str):
+def _date_input(label: str, value, *, key: str, help_text: str | None = None):
     return st.date_input(
         label,
         value,
@@ -31,12 +40,15 @@ def _date_input(label: str, value, *, key: str):
         max_value=MAX_DATE,
         format="DD.MM.YYYY",
         key=key,
+        help=help_text,
     )
 
 
 def _period_query() -> SalesMetricsQuery:
     days = _date_input("Текущий период", DEMO_PERIOD, key="period")
-    cutoff = _date_input("Срез когорты", DEMO_CUTOFF, key="cutoff")
+    cutoff = _date_input(
+        "Срез когорты", DEMO_CUTOFF, key="cutoff", help_text=CUTOFF_HELP
+    )
     compare_enabled = st.toggle("Сравнить периоды", key="compare")
     if len(days) != 2:
         raise ValueError("Выберите начало и конец текущего периода.")
@@ -44,11 +56,14 @@ def _period_query() -> SalesMetricsQuery:
     values = {"start_date": start, "end_date": end, "cutoff_date": cutoff}
     if compare_enabled:
         compare_end = max(MIN_DATE, start - timedelta(days=1))
-        default_start = max(MIN_DATE, compare_end - (end - start))
+        span = max(timedelta(), min(end - start, compare_end - MIN_DATE))
+        default_start = compare_end - span
         compare = _date_input(
             "Период сравнения", (default_start, compare_end), key="compare_period"
         )
-        comparison_cutoff = _date_input("Срез сравнения", None, key="compare_cutoff")
+        comparison_cutoff = _date_input(
+            "Срез сравнения", None, key="compare_cutoff", help_text=CUTOFF_HELP
+        )
         if len(compare) != 2:
             raise ValueError("Выберите начало и конец периода сравнения.")
         values.update(
@@ -59,6 +74,10 @@ def _period_query() -> SalesMetricsQuery:
     try:
         return SalesMetricsQuery.model_validate(values)
     except ValidationError as exc:
+        if exc.errors()[0]["type"] == CUTOFF_BEFORE_PERIOD_END:
+            raise ValueError(
+                "Дата среза должна совпадать с последним днём своего периода или быть позже."
+            ) from exc
         raise ValueError(
             f"Проверьте даты. Каждый период должен содержать от 1 до {MAX_REPORT_DAYS} дней."
         ) from exc
@@ -72,15 +91,8 @@ def _split_report(
     return report, None
 
 
-def _dimension_filters(
-    current: SalesReport, comparison: SalesReport | None
-) -> tuple[str | None, str | None]:
-    reports = (current,) if comparison is None else (current, comparison)
-    managers = {
-        str(row.manager_id): row.manager_name
-        for report in reports
-        for row in report.by_manager
-    }
+def _dimension_filters(dimensions: SalesDimensions) -> tuple[str | None, str | None]:
+    managers = {str(row.manager_id): row.manager_name for row in dimensions.managers}
     duplicates = Counter(managers.values())
     manager_labels = {
         identifier: f"{name} · {identifier[:8]}" if duplicates[name] > 1 else name
@@ -100,10 +112,9 @@ def _dimension_filters(
         ),
         key="manager",
     )
-    sources = {row.source for report in reports for row in report.by_source}
     source = st.selectbox(
         "Канал привлечения",
-        [None, *sorted(sources, key=source_label)],
+        [None, *sorted(dimensions.sources, key=source_label)],
         format_func=lambda name: source_label(name) if name else "Все каналы",
         key="source",
     )
@@ -126,26 +137,26 @@ def main() -> None:
 
         if st.button("Обновить данные", icon=":material/refresh:", width="stretch"):
             get_report.clear()
+            get_dimensions.clear()
 
         base_url = get_api_url()
         try:
-            with st.spinner("Получаем отчёт…"):
-                current, comparison = _split_report(get_report(base_url, query))
+            with st.spinner("Получаем справочники…"):
+                dimensions = get_dimensions(base_url)
         except DashboardAPIError as exc:
             st.error(str(exc))
             st.stop()
-        manager, source = _dimension_filters(current, comparison)
+        manager, source = _dimension_filters(dimensions)
 
-    if manager is not None or source is not None:
-        filters = query.model_dump() | {"manager_id": manager, "source": source}
-        try:
-            with st.spinner("Применяем фильтры…"):
-                current, comparison = _split_report(
-                    get_report(base_url, SalesMetricsQuery.model_validate(filters))
-                )
-        except DashboardAPIError as exc:
-            st.error(str(exc))
-            st.stop()
+    filters = query.model_dump() | {"manager_id": manager, "source": source}
+    try:
+        with st.spinner("Получаем отчёт…"):
+            current, comparison = _split_report(
+                get_report(base_url, SalesMetricsQuery.model_validate(filters))
+            )
+    except DashboardAPIError as exc:
+        st.error(str(exc))
+        st.stop()
 
     caption = (
         f"{period_label(current.period)} · Срез {current.period.cutoff_date:%d.%m.%Y}"

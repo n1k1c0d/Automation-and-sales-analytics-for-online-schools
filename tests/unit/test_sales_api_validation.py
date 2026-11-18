@@ -45,6 +45,26 @@ def test_metrics_reject_invalid_filters_before_accessing_database(
 
 
 @pytest.mark.parametrize(
+    "changes",
+    [
+        {"cutoff_date": "2026-05-01"},
+        {
+            "compare_start_date": "2026-05-01",
+            "compare_end_date": "2026-05-31",
+            "compare_cutoff_date": "2026-05-30",
+        },
+    ],
+    ids=["current-cutoff", "comparison-cutoff"],
+)
+def test_metrics_reject_cutoff_before_period_end(
+    client: TestClient, changes: dict[str, str]
+) -> None:
+    response = client.get("/api/v1/metrics", params=PERIOD | changes)
+    assert response.status_code == HTTPStatus.UNPROCESSABLE_ENTITY
+    assert response.json()["detail"][0]["type"] == "cutoff_before_period_end"
+
+
+@pytest.mark.parametrize(
     "names",
     [
         [],
@@ -118,6 +138,9 @@ def test_missing_database_settings_keep_health_available(client: TestClient) -> 
     assert client.get("/health").json() == {"status": "ok"}
     response = client.get("/api/v1/metrics", params=PERIOD)
     assert response.status_code == HTTPStatus.SERVICE_UNAVAILABLE
+    assert (
+        client.get("/api/v1/dimensions").status_code == HTTPStatus.SERVICE_UNAVAILABLE
+    )
 
 
 def test_database_errors_do_not_expose_sql_or_credentials(
@@ -135,8 +158,9 @@ def test_database_errors_do_not_expose_sql_or_credentials(
     }
 
 
-def test_openapi_describes_both_sales_endpoints(client: TestClient) -> None:
+def test_openapi_describes_sales_endpoints(client: TestClient) -> None:
     paths = client.get("/openapi.json").json()["paths"]
+    assert "get" in paths["/api/v1/dimensions"]
     assert (
         "multipart/form-data"
         in paths["/api/v1/import"]["post"]["requestBody"]["content"]
