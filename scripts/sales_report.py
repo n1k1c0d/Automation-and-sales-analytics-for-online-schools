@@ -7,7 +7,7 @@ from uuid import UUID
 from pydantic import ValidationError
 from sqlalchemy.exc import SQLAlchemyError
 
-from app.analytics.sales import ReportPeriod, load_sales_report
+from app.analytics.sales import ReportPeriod, read_sales_report
 from app.core.config import PostgresSettings
 from app.database.connection import create_db_engine
 
@@ -52,24 +52,13 @@ def main() -> int:
 
     engine = create_db_engine(settings)
     try:
-        with (
-            engine.connect().execution_options(
-                isolation_level="REPEATABLE READ"
-            ) as connection,
-            connection.begin(),
-        ):
-            connection.exec_driver_sql("SET TRANSACTION READ ONLY")
-            filters = {"manager_id": args.manager_id, "source": args.source}
-            current = load_sales_report(connection, period, **filters).model_dump(
-                mode="json"
-            )
-            output = current
-            if comparison_period is not None:
-                comparison = load_sales_report(connection, comparison_period, **filters)
-                output = {
-                    "current": current,
-                    "comparison": comparison.model_dump(mode="json"),
-                }
+        output = read_sales_report(
+            engine,
+            period,
+            comparison_period=comparison_period,
+            manager_id=args.manager_id,
+            source=args.source,
+        ).model_dump(mode="json")
     except ValueError as exc:
         print(f"Report failed: {exc}", file=sys.stderr)
         return 2

@@ -6,7 +6,7 @@ from uuid import UUID
 from zoneinfo import ZoneInfo
 
 from pydantic import BaseModel, ConfigDict, model_validator
-from sqlalchemy import Connection, text
+from sqlalchemy import Connection, Engine, text
 
 BUSINESS_ZONE = ZoneInfo("Europe/Moscow")
 REPORT_SQL = text(
@@ -68,6 +68,11 @@ class SalesReport(BaseModel):
     by_source: list[SourceSalesMetrics]
 
 
+class SalesReportComparison(BaseModel):
+    current: SalesReport
+    comparison: SalesReport
+
+
 def _business_midnight(day: date, *, next_day: bool = False) -> datetime:
     try:
         if next_day:
@@ -120,3 +125,29 @@ def load_sales_report(
             SourceSalesMetrics.model_validate(row) for row in by_grain["source"]
         ],
     )
+
+
+def read_sales_report(
+    engine: Engine,
+    period: ReportPeriod,
+    *,
+    comparison_period: ReportPeriod | None = None,
+    manager_id: UUID | None = None,
+    source: str | None = None,
+) -> SalesReport | SalesReportComparison:
+    with (
+        engine.connect().execution_options(
+            isolation_level="REPEATABLE READ"
+        ) as connection,
+        connection.begin(),
+    ):
+        connection.exec_driver_sql("SET TRANSACTION READ ONLY")
+        current = load_sales_report(
+            connection, period, manager_id=manager_id, source=source
+        )
+        if comparison_period is None:
+            return current
+        comparison = load_sales_report(
+            connection, comparison_period, manager_id=manager_id, source=source
+        )
+        return SalesReportComparison(current=current, comparison=comparison)

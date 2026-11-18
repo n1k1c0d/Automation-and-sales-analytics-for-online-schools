@@ -12,6 +12,11 @@ from pydantic import (
     model_validator,
 )
 
+SOURCE_SYSTEM_PATTERN = r"^[a-z0-9_]{1,64}$"
+type SourceSystem = Annotated[
+    str, StringConstraints(strip_whitespace=True, pattern=SOURCE_SYSTEM_PATTERN)
+]
+
 
 def _utc_timestamp(value: object, info: ValidationInfo) -> datetime:
     if isinstance(value, datetime):
