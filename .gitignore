@@ -1,0 +1,57 @@
+# Локальное окружение и секреты
+.env
+.env.*
+!.env.example
+*.env
+secrets/
+private-keys/
+*.pem
+*.key
+*.p12
+*.pfx
+*.jks
+id_rsa*
+id_ed25519*
+
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+.coverage.*
+htmlcov/
+*.egg-info/
+build/
+dist/
+
+# Редакторы и временные файлы
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+Desktop.ini
+*.tmp
+*.swp
+*~
+
+# Локальные логи и дампы БД
+logs/
+*.log
+dumps/
+backups/
+*.dump
+*.backup
+*.sql.gz
+*.sql.bz2
+*.sql.xz
+*.sql.zst
+*.sql.zip
+dump.sql
+dump-*.sql
+dump_*.sql
+
+# Входные файлы могут содержать данные клиентов
+/data/local/
