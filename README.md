@@ -4,7 +4,7 @@ EduFlow AI — проект платформы аналитики и автом�
 
 ## Текущее состояние
 
-В репозитории подготовлены структура проекта, проектная документация и шаблон окружения. Прикладной код появится начиная с TASK-1.2. Статусы и критерии приёмки ведутся в [списке задач](docs/TASKS.md).
+Подготовлены структура репозитория, проектная документация и минимальное приложение FastAPI. Маршрут `GET /health` проверяет доступность HTTP-приложения. Статусы и критерии приёмки ведутся в [списке задач](docs/TASKS.md).
 
 ## Планируемые возможности
 
@@ -15,12 +15,12 @@ EduFlow AI — проект платформы аналитики и автом�
 
 ## Стек и архитектура
 
-| Задача | Планируемые инструменты |
+| Задача | Инструменты проекта |
 |---|---|
-| Окружение, API и конфигурация | Python 3.12, FastAPI, Pydantic, pydantic-settings |
+| Язык, API и конфигурация | Python 3.12, FastAPI, Uvicorn, Pydantic, pydantic-settings |
 | Хранение и миграции | PostgreSQL 16, SQLAlchemy 2.x, psycopg 3, Alembic |
 | Аналитика и интерфейс | SQL, pandas по мере необходимости, Streamlit |
-| Проверки и локальная инфраструктура | pytest, Ruff, Git/GitHub, Docker Compose |
+| Окружение, проверки и инфраструктура | uv, pytest, Ruff, Git/GitHub, Docker Compose |
 | Последующие этапы | LLM API, Structured Outputs / JSON Schema, n8n, Telegram Bot API |
 
 Backend — модульный монолит. PostgreSQL хранит события продаж, слой аналитики рассчитывает метрики, FastAPI отдаёт их через API, а Streamlit отображает результаты. LLM получает рассчитанные показатели и обезличенный текст. Подробнее в [архитектуре](docs/ARCHITECTURE.md).
@@ -36,26 +36,49 @@ Backend — модульный монолит. PostgreSQL хранит собы�
 | `tests/unit/`, `tests/integration/` | Модульные и интеграционные тесты |
 | `docs/` | Спецификация, архитектура, модель данных, KPI и ход работ |
 
-## Локальная проверка TASK-1.1
+## Локальный запуск
 
-Для проверки текущего каркаса нужен Git. Выполните команды в корне рабочей копии.
+Для текущей версии нужны Git, uv и Python 3.12. Если подходящего Python нет, uv может загрузить его при создании окружения. Установите uv по [официальной инструкции](https://docs.astral.sh/uv/getting-started/installation/).
+
+1. Откройте терминал в корне проекта и установите зависимости в `.venv`.
+
+   ```powershell
+   uv --version
+   uv sync --locked
+   uv run --locked python --version
+   ```
+
+   Ожидаемая версия Python — 3.12.x. `pyproject.toml` перечисляет прямые зависимости, а `uv.lock` фиксирует конкретные версии всего дерева зависимостей. Команды `uv run` запускают инструменты из окружения проекта.
+
+2. Запустите API.
+
+   ```powershell
+   uv run --locked python -m uvicorn app.main:app --host 127.0.0.1 --port 8000
+   ```
+
+3. Оставьте сервер запущенным и проверьте ответ во втором терминале. В Windows PowerShell используйте команду ниже.
+
+   ```powershell
+   Invoke-WebRequest -Uri 'http://127.0.0.1:8000/health' | Select-Object StatusCode, Content
+   ```
+
+   В Linux и macOS используйте `curl -i http://127.0.0.1:8000/health`. Ожидаемый результат — HTTP 200 и `{"status":"ok"}`. Документация API доступна на `http://127.0.0.1:8000/docs`. Чтобы остановить сервер, нажмите Ctrl+C в его терминале. Если порт 8000 занят, подставьте другой свободный порт в обе команды.
+
+### Тесты и проверки
+
+Тест обращается к маршруту через FastAPI TestClient. Он проверяет HTTP-код и JSON-ответ. Для запуска теста на уровне приложения хватает TestClient и его HTTP-клиента `httpx2`. [Документация TestClient](https://starlette.dev/testclient/)
+
+Запустите команды из корня проекта.
 
 ```powershell
-git --version
-git status --short --branch
-git log -1 --oneline
-git ls-files
-git check-ignore --no-index -- .env .venv/pyvenv.cfg logs/local.log dumps/local.sql secrets/private.key
-git check-ignore --no-index -- .env.example app/__init__.py tests/__init__.py
+uv run --locked python -m pytest
+uv run --locked ruff check .
+uv run --locked ruff format --check .
 ```
 
-После первого коммита `git log` покажет его, а `git ls-files` — отслеживаемые файлы. Первая проверка игнорирования должна вывести перечисленные локальные файлы. Для второй ожидаются пустой вывод и код выхода 1, означающий, что ни один из трёх путей не игнорируется.
+### Переменные окружения
 
-### Окружение, запуск и тесты
-
-Python 3.12 понадобится с TASK-1.2, Docker с Docker Compose — с TASK-1.3. Параметры будущего подключения перечислены в [шаблоне](.env.example). На TASK-1.3 из шаблона создаётся локальный `.env` и заполняется собственный пароль PostgreSQL. Git игнорирует `.env`.
-
-В текущей версии проверяются только файлы и настройки Git. Команды запуска API, `pytest` и `ruff check` появятся в README после проверки рабочего окружения на TASK-1.2. Команды запуска PostgreSQL будут добавлены на TASK-1.3.
+Для `/health` достаточно установленного Python-окружения. На TASK-1.3 понадобятся Docker Compose и локальный `.env` с настройками PostgreSQL из [шаблона](.env.example). Git игнорирует `.env`.
 
 ## Данные и пример отчёта
 
