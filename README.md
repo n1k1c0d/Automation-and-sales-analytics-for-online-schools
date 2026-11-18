@@ -4,7 +4,7 @@ EduFlow AI — проект платформы аналитики и автом�
 
 ## Текущее состояние
 
-Подготовлены структура репозитория, проектная документация и минимальное приложение FastAPI. Маршрут `GET /health` проверяет доступность HTTP-приложения. Статусы и критерии приёмки ведутся в [списке задач](docs/TASKS.md).
+Подготовлены структура репозитория, минимальное приложение FastAPI и локальный PostgreSQL 16 через Docker Compose. Маршрут `GET /health` проверяет доступность HTTP-приложения. Подключение к базе проверяется отдельной командой. Статусы и критерии приёмки ведутся в [списке задач](docs/TASKS.md).
 
 ## Планируемые возможности
 
@@ -76,9 +76,48 @@ uv run --locked ruff check .
 uv run --locked ruff format --check .
 ```
 
-### Переменные окружения
+## Локальный PostgreSQL 16
 
-Для `/health` достаточно установленного Python-окружения. На TASK-1.3 понадобятся Docker Compose и локальный `.env` с настройками PostgreSQL из [шаблона](.env.example). Git игнорирует `.env`.
+Нужен запущенный Docker с командой `docker compose`. На Windows подойдёт Docker Desktop с Linux-контейнерами. Все команды выполняются из корня проекта.
+
+1. При первом запуске скопируйте шаблон и задайте пароль в `.env`. Шаблон хранится в Git, а локальный `.env` игнорируется.
+
+   ```powershell
+   if (-not (Test-Path -LiteralPath '.env')) {
+       Copy-Item -LiteralPath '.env.example' -Destination '.env'
+   }
+   ```
+
+   Заполните `POSTGRES_PASSWORD` собственным паролем. `POSTGRES_DB` и `POSTGRES_USER` задают имя базы и пользователя. Для Python на хосте используются `POSTGRES_HOST=127.0.0.1` и `POSTGRES_PORT=5432`. Если порт занят, задайте в `.env` свободный порт, например `5433`.
+
+2. Проверьте конфигурацию, запустите PostgreSQL и дождитесь готовности.
+
+   ```powershell
+   docker compose config --quiet
+   docker compose up --wait --wait-timeout 90 postgres
+   docker compose ps postgres
+   ```
+
+   В `docker compose ps postgres` ожидается статус `healthy`. Docker публикует порт на `127.0.0.1`. Каталог данных PostgreSQL хранится в именованном томе `eduflow-ai_postgres_data`. [Документация образа PostgreSQL](https://hub.docker.com/_/postgres)
+
+3. Проверьте соединение из Python.
+
+   ```powershell
+   uv sync --locked
+   uv run --locked python -m scripts.check_db
+   ```
+
+   Команда выполняет `SHOW server_version` и выводит версию PostgreSQL и сообщение `is reachable`. При ошибке она возвращает код 1 и предлагает проверить настройки или состояние контейнера.
+
+4. Для остановки и повторного запуска используйте следующие команды.
+
+   ```powershell
+   docker compose stop postgres
+   docker compose up --wait --wait-timeout 90 postgres
+   uv run --locked python -m scripts.check_db
+   ```
+
+   Команды сохраняют именованный том с данными. Образ применяет `POSTGRES_DB`, `POSTGRES_USER` и `POSTGRES_PASSWORD` при инициализации пустого тома. Для существующего тома указывайте текущие реквизиты базы. При проблеме запуска проверьте `docker compose ps postgres` и `docker compose logs --tail 40 postgres`. [Переменные официального образа](https://hub.docker.com/_/postgres)
 
 ## Данные и пример отчёта
 
