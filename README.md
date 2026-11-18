@@ -4,7 +4,7 @@ EduFlow AI — проект платформы аналитики и автом�
 
 ## Текущее состояние
 
-Подготовлены структура репозитория, минимальное приложение FastAPI и локальный PostgreSQL 16 через Docker Compose. Маршрут `GET /health` проверяет доступность HTTP-приложения. Подключение к базе проверяется отдельной командой. Статусы и критерии приёмки ведутся в [списке задач](docs/TASKS.md).
+Подготовлены минимальное приложение FastAPI, локальный PostgreSQL 16 и первая миграция пяти таблиц. Маршрут `GET /health` проверяет доступность HTTP-приложения. Подключение к базе проверяется отдельной командой. Статусы и критерии приёмки ведутся в [списке задач](docs/TASKS.md).
 
 ## Планируемые возможности
 
@@ -119,9 +119,53 @@ uv run --locked ruff format --check .
 
    Команды сохраняют именованный том с данными. Образ применяет `POSTGRES_DB`, `POSTGRES_USER` и `POSTGRES_PASSWORD` при инициализации пустого тома. Для существующего тома указывайте текущие реквизиты базы. При проблеме запуска проверьте `docker compose ps postgres` и `docker compose logs --tail 40 postgres`. [Переменные официального образа](https://hub.docker.com/_/postgres)
 
+## Миграции базы данных
+
+Запустите PostgreSQL и выполните `uv sync --locked`. Для просмотра SQL первой миграции выполните команду ниже. Alembic выведет SQL в терминал в автономном режиме. [Генерация SQL в Alembic](https://alembic.sqlalchemy.org/en/latest/offline.html)
+
+```powershell
+uv run --locked alembic upgrade head --sql
+```
+
+Примените миграции к локальной базе из `.env` и проверьте результат.
+
+```powershell
+uv run --locked alembic upgrade head
+uv run --locked alembic current
+uv run --locked alembic check
+```
+
+Ожидаются ревизия `0001 (head)` и сообщение `No new upgrade operations detected.` Alembic записывает номер применённой ревизии в таблицу `alembic_version`. Правила предметной области проверяются ограничениями PostgreSQL.
+
+### Проверка отката
+
+В PowerShell создайте отдельную временную базу. В примере откатывается её схема, а в конце удаляется только эта временная база.
+
+```powershell
+$testDb = 'eduflow_migration_' + [Guid]::NewGuid().ToString('N')
+docker compose exec -T postgres sh -c 'createdb -U "$POSTGRES_USER" -- "$1"' sh $testDb
+if ($LASTEXITCODE -ne 0) { throw 'Не удалось создать тестовую базу.' }
+
+$previousDb = $env:POSTGRES_DB
+try {
+    $env:POSTGRES_DB = $testDb
+    uv run --locked alembic upgrade head
+    if ($LASTEXITCODE -ne 0) { throw 'Первая миграция завершилась ошибкой.' }
+    uv run --locked alembic downgrade base
+    if ($LASTEXITCODE -ne 0) { throw 'Откат завершился ошибкой.' }
+    uv run --locked alembic upgrade head
+    if ($LASTEXITCODE -ne 0) { throw 'Повторная миграция завершилась ошибкой.' }
+    uv run --locked alembic check
+    if ($LASTEXITCODE -ne 0) { throw 'Схема требует проверки.' }
+} finally {
+    $env:POSTGRES_DB = $previousDb
+    docker compose exec -T postgres sh -c 'dropdb -U "$POSTGRES_USER" -- "$1"' sh $testDb
+}
+```
+
 ## Данные и пример отчёта
 
-На TASK-1.4 спроектирована схема для менеджеров, лидов, уроков, банковских заявок и оплат. Первая миграция запланирована на TASK-1.5. В первой версии используются синтетические данные. Бизнес-даты отображаются в часовом поясе Москвы. ER-диаграмма и ограничения приведены в [модели данных](docs/DATA_MODEL.md).
+Схема включает менеджеров, лиды, уроки, банковские заявки и оплаты. В первой версии используются синтетические данные. Бизнес-даты отображаются в часовом поясе Москвы. ER-диаграмма и ограничения приведены в [модели данных](docs/DATA_MODEL.md).
 
 Пример будущего отчёта. Из двух лидов с первым проведённым уроком в выбранном периоде один отправил банковскую заявку и внёс два платежа по 30 000 ₽. Конверсия в заявку и в оплату составит по 50%. Сумма успешных оплат составит 60 000 ₽, средний оплаченный чек за тот же период — 60 000 ₽ на одного платящего лида. Полные правила приведены в [справочнике KPI](docs/KPI_DEFINITIONS.md).
 

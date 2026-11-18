@@ -1,6 +1,6 @@
 # Модель данных
 
-Спецификация схемы PostgreSQL 16 для TASK-1.4. Типы, ограничения и индексы из этого документа служат основой для моделей SQLAlchemy и первой миграции Alembic на TASK-1.5.
+Спецификация схемы PostgreSQL 16 для первой ревизии Alembic `0001`. Типы, ограничения и индексы сопоставлены с [моделями SQLAlchemy](../app/database/models/sales.py) и [миграцией](../migrations/versions/0001_initial_schema.py).
 
 ## ER-диаграмма
 

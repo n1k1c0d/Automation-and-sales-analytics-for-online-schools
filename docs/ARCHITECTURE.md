@@ -67,6 +67,7 @@ flowchart LR
 - `create_db_engine` в `app/database/connection.py` собирает параметры подключения через SQLAlchemy `URL.create`. Движок использует psycopg 3 и проверяет соединения из пула перед использованием.
 - `python -m scripts.check_db` выполняет запрос через настоящее подключение. `GET /health` служит проверкой процесса API. Материалы для запуска и диагностики собраны в [README](../README.md).
 - Структуру пяти таблиц, связи и ограничения для первой миграции задаёт [модель данных](DATA_MODEL.md).
+- Модели SQLAlchemy используют общую `Base.metadata`. Alembic сравнивает метаданные с PostgreSQL и применяет версионированные миграции. При запуске API схема управляется отдельно через команды из [README](../README.md#миграции-базы-данных). [Сравнение схем в Alembic](https://alembic.sqlalchemy.org/en/latest/autogenerate.html)
 
 ## Границы и развитие
 
