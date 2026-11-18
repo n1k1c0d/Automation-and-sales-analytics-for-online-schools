@@ -1,0 +1,27 @@
+{
+  "code": "quality",
+  "managers": {
+    "M01": {
+      "lesson_completion_pp": 20,
+      "bank_application_pp": 20,
+      "payment_success_pp": 23
+    },
+    "M08": {
+      "lesson_completion_pp": -25,
+      "bank_application_pp": -22,
+      "payment_success_pp": -25
+    }
+  },
+  "sources": {
+    "referral": {
+      "lesson_completion_pp": 18,
+      "bank_application_pp": 18,
+      "payment_success_pp": 20
+    },
+    "paid_search": {
+      "lesson_completion_pp": -24,
+      "bank_application_pp": -20,
+      "payment_success_pp": -22
+    }
+  }
+}

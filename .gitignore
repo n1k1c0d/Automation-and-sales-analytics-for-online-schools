@@ -55,3 +55,7 @@ dump_*.sql
 
 # Входные файлы могут содержать данные клиентов
 /data/local/
+
+# Воспроизводимый вывод генератора
+/data/synthetic/generated/
+/data/synthetic/scenarios/
