@@ -7,12 +7,17 @@ from uuid import UUID
 from sqlalchemy import CheckConstraint, ForeignKey, Index, Numeric, Text, text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
-from app.database.models.base import Base
+from app.database.models.base import (
+    Base,
+    ExternalIdentity,
+    external_identity_constraints,
+)
 
 
-class Manager(Base):
+class Manager(ExternalIdentity, Base):
     __tablename__ = "managers"
     __table_args__ = (
+        *external_identity_constraints(__tablename__),
         CheckConstraint("name ~ '[^[:space:]]'", name="ck_managers_name_nonblank"),
         CheckConstraint("team ~ '[^[:space:]]'", name="ck_managers_team_nonblank"),
         CheckConstraint("isfinite(created_at)", name="ck_managers_created_at_finite"),
@@ -32,9 +37,10 @@ class Manager(Base):
     )
 
 
-class Lead(Base):
+class Lead(ExternalIdentity, Base):
     __tablename__ = "leads"
     __table_args__ = (
+        *external_identity_constraints(__tablename__),
         CheckConstraint("source ~ '[^[:space:]]'", name="ck_leads_source_nonblank"),
         CheckConstraint("isfinite(created_at)", name="ck_leads_created_at_finite"),
         CheckConstraint(
@@ -67,9 +73,10 @@ class Lead(Base):
     )
 
 
-class Lesson(Base):
+class Lesson(ExternalIdentity, Base):
     __tablename__ = "lessons"
     __table_args__ = (
+        *external_identity_constraints(__tablename__),
         CheckConstraint(
             "status IN ('scheduled', 'completed', 'cancelled', 'no_show')",
             name="ck_lessons_status",
@@ -100,9 +107,10 @@ class Lesson(Base):
     lead: Mapped[Lead] = relationship(back_populates="lessons")
 
 
-class BankApplication(Base):
+class BankApplication(ExternalIdentity, Base):
     __tablename__ = "bank_applications"
     __table_args__ = (
+        *external_identity_constraints(__tablename__),
         CheckConstraint(
             "status IN ('submitted', 'approved', 'declined', 'cancelled')",
             name="ck_bank_applications_status",
@@ -131,9 +139,10 @@ class BankApplication(Base):
     lead: Mapped[Lead] = relationship(back_populates="bank_applications")
 
 
-class Payment(Base):
+class Payment(ExternalIdentity, Base):
     __tablename__ = "payments"
     __table_args__ = (
+        *external_identity_constraints(__tablename__),
         CheckConstraint(
             "status IN ('pending', 'paid', 'refunded')", name="ck_payments_status"
         ),
