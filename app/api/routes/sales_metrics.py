@@ -3,9 +3,10 @@ from typing import Annotated
 
 from fastapi import APIRouter, Query, Request
 
-from app.analytics.sales import SalesReport, SalesReportComparison, read_sales_report
+from app.analytics.sales import read_sales_report
 from app.api.database import get_db_engine
 from app.schemas.sales_metrics import SalesMetricsQuery
+from app.schemas.sales_report import SalesReport, SalesReportComparison
 
 router = APIRouter(prefix="/api/v1", tags=["sales"])
 

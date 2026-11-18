@@ -11,7 +11,7 @@ from pydantic import (
     model_validator,
 )
 
-from app.analytics.sales import ReportPeriod
+from app.schemas.sales_report import ReportPeriod
 
 MAX_REPORT_DAYS = 366
 
