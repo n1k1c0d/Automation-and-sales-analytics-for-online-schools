@@ -106,7 +106,15 @@ class LLMError(Exception):
 
 
 def _status_error(error: APIStatusError) -> LLMError:
-    if error.status_code in {HTTPStatus.UNAUTHORIZED, HTTPStatus.FORBIDDEN}:
+    if (
+        error.status_code == HTTPStatus.BAD_REQUEST
+        and error.code == "json_validate_failed"
+    ):
+        code, message = (
+            LLMErrorCode.INVALID_RESPONSE,
+            "The generated output does not match the requested schema.",
+        )
+    elif error.status_code in {HTTPStatus.UNAUTHORIZED, HTTPStatus.FORBIDDEN}:
         code, message = (
             LLMErrorCode.AUTHENTICATION,
             "Check the API key and model access.",

@@ -3,7 +3,6 @@ import logging
 from collections.abc import Callable
 from decimal import Decimal
 from pathlib import Path
-from typing import Literal
 
 import httpx
 import pytest
@@ -11,18 +10,17 @@ from pydantic import BaseModel, ValidationError
 
 from app.ai import client as llm
 from app.ai.client import LLMClient, LLMError, LLMErrorCode, LLMOperation, LLMUsage
+from app.ai.rejections import ClassificationPlan
+from app.ai.sales_analysis import QuestionPlan, SummaryPlan
 from app.core.config import LLMSettings, PostgresSettings
 from scripts.ai_sales import main as ai_sales
+from scripts.check_llm import ConnectionCheck
 from scripts.check_llm import main as check_llm
 
 KEY = "unit-test-token"
 PROVIDER_MESSAGE = "private provider message"
 REQUEST_ID = "req_test"
 REQUEST_HEADERS = {"x-request-id": REQUEST_ID}
-
-
-class StructuredStatus(BaseModel):
-    status: Literal["ok"]
 
 
 @pytest.fixture(autouse=True)
@@ -73,11 +71,16 @@ def _http_client(handler: Callable[[httpx.Request], httpx.Response]) -> httpx.Cl
     return httpx.Client(transport=httpx.MockTransport(handler))
 
 
-def _generate(client: LLMClient, *, prompt: str = "A synthetic prompt."):
+def _generate(
+    client: LLMClient,
+    *,
+    prompt: str = "A synthetic prompt.",
+    schema: type[BaseModel] = ConnectionCheck,
+):
     return client.generate(
         instructions="Return the requested status.",
         prompt=prompt,
-        schema=StructuredStatus,
+        schema=schema,
     )
 
 
@@ -131,7 +134,7 @@ def test_uses_strict_structured_outputs_and_accounts_for_usage(
     assert json_schema["strict"] is True
     assert json_schema["schema"]["additionalProperties"] is False
     assert json_schema["schema"]["required"] == ["status"]
-    assert result.output == StructuredStatus(status="ok")
+    assert result.output == ConnectionCheck(status="ok")
     assert result.model == "qwen-test" and result.response_id == "chatcmpl-test"
     assert result.request_id == REQUEST_ID
     assert result.usage == LLMUsage(900, 400, 100, 1000, Decimal("0.002"))
@@ -164,7 +167,7 @@ def test_missing_provider_usage_is_reported_as_unknown() -> None:
     http_client = _http_client(lambda _: httpx.Response(200, json=payload))
     with LLMClient(_settings(), http_client=http_client) as client:
         result = _generate(client)
-    assert result.output == StructuredStatus(status="ok")
+    assert result.output == ConnectionCheck(status="ok")
     assert result.usage is None
     assert result.request_id == "req_body"
 
@@ -178,12 +181,134 @@ def test_groq_usage_without_cache_details() -> None:
     assert result.usage == LLMUsage(900, 0, 100, 1000, None)
 
 
+def _assert_closed_objects(node: object) -> None:
+    if isinstance(node, dict):
+        if node.get("type") == "object":
+            assert node["additionalProperties"] is False
+            assert set(node["required"]) == set(node["properties"])
+        for child in node.values():
+            _assert_closed_objects(child)
+    elif isinstance(node, list):
+        for child in node:
+            _assert_closed_objects(child)
+
+
+METRIC = {"scope": "total", "metric": "leads"}
+RANKING = {
+    "dimension": "source",
+    "metric": "leads",
+    "period": "current",
+    "order": "highest",
+}
+UNCLEAR = {"comment_id": 1, "reason": "unclear", "evidence": None}
+
+
+@pytest.mark.parametrize(
+    ("schema", "example"),
+    [
+        (ConnectionCheck, {"status": "ok"}),
+        (ClassificationPlan, {"classifications": [UNCLEAR]}),
+        (
+            SummaryPlan,
+            {
+                "metrics": [METRIC],
+                "hypotheses": [{"kind": "source_mix", "evidence": METRIC}],
+            },
+        ),
+        (QuestionPlan, {"status": "answered", "metrics": [METRIC], "ranking": None}),
+        (QuestionPlan, {"status": "answered", "metrics": [], "ranking": RANKING}),
+    ],
+    ids=[
+        "connection",
+        "classification",
+        "summary",
+        "question-value",
+        "question-ranking",
+    ],
+)
+def test_production_structured_output_contract(
+    schema: type[BaseModel], example: dict
+) -> None:
+    def respond(request: httpx.Request) -> httpx.Response:
+        response_format = json.loads(request.content)["response_format"]
+        assert response_format["type"] == "json_schema"
+        descriptor = response_format["json_schema"]
+        assert descriptor["name"] == schema.__name__
+        assert descriptor["strict"] is True
+        definition = descriptor["schema"]
+        _assert_closed_objects(definition)
+        if schema is ClassificationPlan:
+            item = definition["$defs"]["RejectionClassification"]
+            assert {"type": "null"} in item["properties"]["evidence"]["anyOf"]
+        if schema is QuestionPlan:
+            assert {"type": "null"} in definition["properties"]["ranking"]["anyOf"]
+        return httpx.Response(200, json=_payload(json.dumps(example)))
+
+    with LLMClient(_settings(), http_client=_http_client(respond)) as client:
+        result = _generate(client, schema=schema)
+    assert type(result.output) is schema
+    assert result.output.model_dump(mode="json") == example
+
+
+@pytest.mark.parametrize(
+    ("schema", "invalid"),
+    [
+        (ConnectionCheck, {"status": "ok", "detail": True}),
+        (ConnectionCheck, {"status": 1}),
+        (ClassificationPlan, {"classifications": [UNCLEAR | {"comment_id": "1"}]}),
+        (ClassificationPlan, {"classifications": [UNCLEAR | {"note": "extra"}]}),
+        (
+            ClassificationPlan,
+            {"classifications": [{"comment_id": 1, "reason": "unclear"}]},
+        ),
+        (SummaryPlan, {"metrics": [METRIC | {"metric": 1}], "hypotheses": []}),
+        (
+            SummaryPlan,
+            {
+                "metrics": [METRIC],
+                "hypotheses": [
+                    {"kind": "source_mix", "evidence": METRIC | {"value": 3}}
+                ],
+            },
+        ),
+        (QuestionPlan, {"status": "answered", "metrics": [METRIC]}),
+        (QuestionPlan, {"status": "answered", "metrics": [], "ranking": False}),
+        (
+            QuestionPlan,
+            {"status": "answered", "metrics": [], "ranking": RANKING | {"limit": 1}},
+        ),
+    ],
+    ids=[
+        "connection-extra",
+        "connection-type",
+        "classification-type",
+        "classification-extra",
+        "missing-evidence",
+        "metric-type",
+        "nested-hypothesis-extra",
+        "missing-ranking",
+        "ranking-type",
+        "ranking-extra",
+    ],
+)
+def test_production_schema_rejects_invalid_output(
+    schema: type[BaseModel], invalid: dict
+) -> None:
+    transport = _http_client(
+        lambda _: httpx.Response(200, json=_payload(json.dumps(invalid)))
+    )
+    with (
+        LLMClient(_settings(), http_client=transport) as client,
+        pytest.raises(LLMError) as caught,
+    ):
+        _generate(client, schema=schema)
+    assert caught.value.code == LLMErrorCode.INVALID_RESPONSE
+
+
 @pytest.mark.parametrize(
     ("payload", "expected"),
     [
         (_payload(PROVIDER_MESSAGE), LLMErrorCode.INVALID_RESPONSE),
-        (_payload('{"status":42}'), LLMErrorCode.INVALID_RESPONSE),
-        (_payload('{"status":"ok","extra":true}'), LLMErrorCode.INVALID_RESPONSE),
         (_payload(refusal=True), LLMErrorCode.REFUSED),
         (
             _payload('{"status":', finish_reason="length"),
@@ -192,20 +317,26 @@ def test_groq_usage_without_cache_details() -> None:
         (_payload(None, finish_reason="content_filter"), LLMErrorCode.REFUSED),
         (_payload(None, finish_reason="tool_calls"), LLMErrorCode.INCOMPLETE),
         (_payload(None), LLMErrorCode.INVALID_RESPONSE),
+        (_payload(""), LLMErrorCode.INVALID_RESPONSE),
     ],
     ids=[
         "invalid-json",
-        "wrong-type",
-        "extra-field",
         "refusal",
         "truncated-json",
         "filtered",
         "unexpected-tool-call",
+        "null-content",
         "empty-content",
     ],
 )
+@pytest.mark.parametrize(
+    "schema", [ConnectionCheck, ClassificationPlan, SummaryPlan, QuestionPlan]
+)
 def test_unsuccessful_generation_preserves_usage(
-    payload: dict, expected: LLMErrorCode, caplog: pytest.LogCaptureFixture
+    schema: type[BaseModel],
+    payload: dict,
+    expected: LLMErrorCode,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     http_client = _http_client(
         lambda _: httpx.Response(200, headers=REQUEST_HEADERS, json=payload)
@@ -215,7 +346,7 @@ def test_unsuccessful_generation_preserves_usage(
         LLMClient(_settings(), http_client=http_client) as client,
         pytest.raises(LLMError) as caught,
     ):
-        _generate(client)
+        _generate(client, schema=schema)
     error = caught.value
     assert error.code == expected
     assert error.model == "qwen-test"
@@ -228,6 +359,7 @@ def test_unsuccessful_generation_preserves_usage(
     ("status", "provider_code", "expected"),
     [
         (400, "invalid_request", LLMErrorCode.REQUEST_REJECTED),
+        (400, "json_validate_failed", LLMErrorCode.INVALID_RESPONSE),
         (401, "invalid_api_key", LLMErrorCode.AUTHENTICATION),
         (403, "permission_denied", LLMErrorCode.AUTHENTICATION),
         (408, "timeout", LLMErrorCode.TIMEOUT),
