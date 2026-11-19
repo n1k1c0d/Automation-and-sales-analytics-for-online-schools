@@ -19,7 +19,8 @@ FastAPI принимает CSV и Excel и возвращает KPI из Postgre
 | Хранение и миграции | PostgreSQL 16, SQLAlchemy 2.x, psycopg 3, Alembic |
 | Аналитика и интерфейс | SQL, Streamlit, Altair |
 | Окружение, проверки и инфраструктура | uv, pytest, Ruff, Git/GitHub, Docker Compose |
-| Последующие этапы | LLM API, Structured Outputs / JSON Schema, n8n, Telegram Bot API |
+| AI | OpenAI Responses API, Structured Outputs / JSON Schema |
+| Планируемая автоматизация | n8n, Telegram Bot API |
 
 Backend — модульный монолит. PostgreSQL хранит события продаж, слой аналитики рассчитывает метрики, FastAPI отдаёт их через API, а Streamlit отображает результаты. LLM получает рассчитанные показатели и обезличенный текст. Подробнее в [архитектуре](docs/ARCHITECTURE.md).
 
@@ -296,3 +297,4 @@ uv run --locked python -m streamlit run dashboard/main.py --server.address 127.0
 - [Технические решения](docs/DECISIONS.md)
 - [История изменений](docs/CHANGELOG.md)
 - [Отчёт о проверке второго этапа](docs/STAGE_2_TEST_REPORT.md)
+- [Настройка и проверка LLM-клиента](docs/LLM.md)
