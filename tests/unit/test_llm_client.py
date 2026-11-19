@@ -36,42 +36,34 @@ def _settings(**overrides) -> LLMSettings:
 
 
 def _payload(
-    output: str = '{"status":"ok"}',
+    output: str | None = '{"status":"ok"}',
     *,
-    status: str = "completed",
-    reason: str | None = None,
+    finish_reason: str = "stop",
     refusal: bool = False,
 ) -> dict:
-    part = (
-        {"type": "refusal", "refusal": PROVIDER_MESSAGE}
-        if refusal
-        else {"type": "output_text", "text": output, "annotations": []}
-    )
     return {
-        "id": "resp_test",
-        "object": "response",
-        "created_at": 0,
-        "status": status,
+        "id": "chatcmpl-test",
+        "object": "chat.completion",
+        "created": 0,
         "model": "qwen-test",
-        "incomplete_details": {"reason": reason} if reason else None,
-        "output": [
-            {"id": "rs_test", "type": "reasoning", "summary": []},
+        "service_tier": "on_demand",
+        "x_groq": {"id": "req_body"},
+        "choices": [
             {
-                "id": "msg_test",
-                "type": "message",
-                "role": "assistant",
-                "status": "completed" if status == "completed" else "incomplete",
-                "content": [part],
+                "index": 0,
+                "finish_reason": finish_reason,
+                "message": {
+                    "role": "assistant",
+                    "content": output,
+                    "refusal": PROVIDER_MESSAGE if refusal else None,
+                },
             },
         ],
-        "parallel_tool_calls": False,
-        "tool_choice": "auto",
-        "tools": [],
         "usage": {
-            "input_tokens": 900,
-            "input_tokens_details": {"cached_tokens": 400, "cache_write_tokens": 0},
-            "output_tokens": 100,
-            "output_tokens_details": {"reasoning_tokens": 40},
+            "prompt_tokens": 900,
+            "prompt_tokens_details": {"cached_tokens": 400},
+            "completion_tokens": 100,
+            "completion_tokens_details": {"reasoning_tokens": 40},
             "total_tokens": 1000,
         },
     }
@@ -114,23 +106,34 @@ def test_uses_strict_structured_outputs_and_accounts_for_usage(
     ):
         result = _generate(client)
     (request,) = requests
-    assert str(request.url) == "https://api.groq.com/openai/v1/responses"
+    assert request.method == "POST"
+    assert str(request.url) == "https://api.groq.com/openai/v1/chat/completions"
     assert request.headers["authorization"] == f"Bearer {KEY}"
     assert set(request.extensions["timeout"].values()) == {1.25}
     body = json.loads(request.content)
     assert body["model"] == "qwen/qwen3.8-27b"
-    assert body["input"] == "A synthetic prompt."
-    assert body["instructions"] == "Return the requested status."
-    assert body["max_output_tokens"] == 256
-    assert body["store"] is False
-    assert body["service_tier"] == "default"
-    output_format = body["text"]["format"]
-    assert output_format["type"] == "json_schema"
-    assert output_format["strict"] is True
-    assert output_format["schema"]["additionalProperties"] is False
-    assert output_format["schema"]["required"] == ["status"]
+    assert body["messages"] == [
+        {"role": "system", "content": "Return the requested status."},
+        {"role": "user", "content": "A synthetic prompt."},
+    ]
+    assert body["max_completion_tokens"] == 256
+    assert body.get("stream", False) is False
+    assert {
+        "store",
+        "service_tier",
+        "max_output_tokens",
+        "instructions",
+        "input",
+        "text",
+    }.isdisjoint(body)
+    assert body["response_format"]["type"] == "json_schema"
+    json_schema = body["response_format"]["json_schema"]
+    assert json_schema["strict"] is True
+    assert json_schema["schema"]["additionalProperties"] is False
+    assert json_schema["schema"]["required"] == ["status"]
     assert result.output == StructuredStatus(status="ok")
-    assert result.request_id == REQUEST_ID and result.response_id == "resp_test"
+    assert result.model == "qwen-test" and result.response_id == "chatcmpl-test"
+    assert result.request_id == REQUEST_ID
     assert result.usage == LLMUsage(900, 400, 100, 1000, Decimal("0.002"))
     assert "total_tokens=1000" in caplog.text
     assert "A synthetic prompt." not in caplog.text and KEY not in caplog.text
@@ -163,6 +166,16 @@ def test_missing_provider_usage_is_reported_as_unknown() -> None:
         result = _generate(client)
     assert result.output == StructuredStatus(status="ok")
     assert result.usage is None
+    assert result.request_id == "req_body"
+
+
+def test_groq_usage_without_cache_details() -> None:
+    payload = _payload()
+    del payload["usage"]["prompt_tokens_details"]
+    http_client = _http_client(lambda _: httpx.Response(200, json=payload))
+    with LLMClient(_settings(), http_client=http_client) as client:
+        result = _generate(client)
+    assert result.usage == LLMUsage(900, 0, 100, 1000, None)
 
 
 @pytest.mark.parametrize(
@@ -173,12 +186,12 @@ def test_missing_provider_usage_is_reported_as_unknown() -> None:
         (_payload('{"status":"ok","extra":true}'), LLMErrorCode.INVALID_RESPONSE),
         (_payload(refusal=True), LLMErrorCode.REFUSED),
         (
-            _payload('{"status":', status="incomplete", reason="max_output_tokens"),
+            _payload('{"status":', finish_reason="length"),
             LLMErrorCode.OUTPUT_LIMIT,
         ),
-        (_payload(status="incomplete", reason="content_filter"), LLMErrorCode.REFUSED),
-        (_payload(status="cancelled"), LLMErrorCode.INCOMPLETE),
-        (_payload(status="failed"), LLMErrorCode.UNAVAILABLE),
+        (_payload(None, finish_reason="content_filter"), LLMErrorCode.REFUSED),
+        (_payload(None, finish_reason="tool_calls"), LLMErrorCode.INCOMPLETE),
+        (_payload(None), LLMErrorCode.INVALID_RESPONSE),
     ],
     ids=[
         "invalid-json",
@@ -187,8 +200,8 @@ def test_missing_provider_usage_is_reported_as_unknown() -> None:
         "refusal",
         "truncated-json",
         "filtered",
-        "cancelled",
-        "failed",
+        "unexpected-tool-call",
+        "empty-content",
     ],
 )
 def test_unsuccessful_generation_preserves_usage(
@@ -205,6 +218,7 @@ def test_unsuccessful_generation_preserves_usage(
         _generate(client)
     error = caught.value
     assert error.code == expected
+    assert error.model == "qwen-test"
     assert error.request_id == REQUEST_ID
     assert error.usage == LLMUsage(900, 400, 100, 1000, None)
     assert PROVIDER_MESSAGE not in str(error) and PROVIDER_MESSAGE not in caplog.text
@@ -286,9 +300,21 @@ def test_rejects_oversized_input_before_request() -> None:
     assert caught.value.code == LLMErrorCode.INVALID_INPUT
 
 
-def test_malformed_provider_envelope_is_an_error() -> None:
+@pytest.mark.parametrize(
+    "body",
+    [
+        "not json",
+        json.dumps(_payload() | {"choices": []}),
+        json.dumps(
+            _payload()
+            | {"usage": {"prompt_tokens": 3, "completion_tokens": 4, "total_tokens": 6}}
+        ),
+    ],
+    ids=["malformed-json", "missing-choice", "inconsistent-tokens"],
+)
+def test_malformed_provider_envelope_is_an_error(body: str) -> None:
     http_client = _http_client(
-        lambda _: httpx.Response(200, headers=REQUEST_HEADERS, text="not json")
+        lambda _: httpx.Response(200, headers=REQUEST_HEADERS, text=body)
     )
     with (
         LLMClient(_settings(), http_client=http_client) as client,
@@ -297,6 +323,25 @@ def test_malformed_provider_envelope_is_an_error() -> None:
         _generate(client)
     assert caught.value.code == LLMErrorCode.INVALID_RESPONSE
     assert caught.value.request_id == REQUEST_ID and caught.value.usage is None
+
+
+def test_redirect_cannot_send_chat_to_another_host() -> None:
+    urls = []
+
+    def redirect(request: httpx.Request) -> httpx.Response:
+        urls.append(str(request.url))
+        return httpx.Response(307, headers={"location": "https://elsewhere.invalid/"})
+
+    http_client = httpx.Client(
+        transport=httpx.MockTransport(redirect), follow_redirects=True
+    )
+    with (
+        LLMClient(_settings(), http_client=http_client) as client,
+        pytest.raises(LLMError) as caught,
+    ):
+        _generate(client)
+    assert caught.value.code == LLMErrorCode.REQUEST_REJECTED
+    assert urls == ["https://api.groq.com/openai/v1/chat/completions"]
 
 
 def test_settings_load_from_dotenv_and_mask_the_key(

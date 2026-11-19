@@ -45,9 +45,10 @@ def _client(plans: Iterable[dict], requests: list[dict] | None = None) -> LLMCli
 
     def respond(request: httpx.Request) -> httpx.Response:
         body = json.loads(request.content)
-        assert body["text"]["format"]["strict"] is True
+        assert body["response_format"]["json_schema"]["strict"] is True
+        assert str(request.url) == "https://api.groq.com/openai/v1/chat/completions"
         if requests is not None:
-            requests.append(json.loads(body["input"]))
+            requests.append(json.loads(body["messages"][1]["content"]))
         return httpx.Response(
             200,
             headers=REQUEST_HEADERS,
@@ -228,12 +229,10 @@ def test_evaluation_counts_output_limits_without_repeating_batches() -> None:
 
     def respond(request: httpx.Request) -> httpx.Response:
         body = json.loads(request.content)
-        assert body["max_output_tokens"] == 2048
-        sent.append(json.loads(body["input"]))
+        assert body["max_completion_tokens"] == 2048
+        sent.append(json.loads(body["messages"][1]["content"]))
         if len(sent) == 1:
-            payload = _payload(
-                '{"classifications":', status="incomplete", reason="max_output_tokens"
-            )
+            payload = _payload('{"classifications":', finish_reason="length")
         else:
             plan = _classification_reply(_classification(1, "price", "дорого"))
             payload = _payload(json.dumps(plan))
@@ -277,7 +276,7 @@ def test_evaluation_cli_prints_json_and_returns_one_for_unclassified_batch(
         json.dumps([{"comment": "Причину не указали.", "expected": "unclear"}]),
         encoding="utf-8",
     )
-    payload = _payload(status="incomplete", reason="max_output_tokens")
+    payload = _payload(finish_reason="length")
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("GROQ_API_KEY", "test-key")
     monkeypatch.setattr(

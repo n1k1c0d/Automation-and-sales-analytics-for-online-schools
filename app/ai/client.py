@@ -6,7 +6,7 @@ from decimal import Decimal
 from enum import StrEnum
 from http import HTTPStatus
 from types import TracebackType
-from typing import TYPE_CHECKING, Self
+from typing import TYPE_CHECKING, Literal, Self
 
 from openai import (
     APIConnectionError,
@@ -15,7 +15,8 @@ from openai import (
     DefaultHttpxClient,
     OpenAI,
 )
-from openai.types.responses import Response, ResponseUsage
+from openai.types.chat.chat_completion import Choice
+from openai.types.completion_usage import CompletionUsage
 from pydantic import BaseModel, ValidationError
 
 from app.core.config import LLMSettings
@@ -133,24 +134,26 @@ def _status_error(error: APIStatusError) -> LLMError:
     return LLMError(code, message, request_id=error.request_id)
 
 
-def _response_failure(response: Response) -> tuple[LLMErrorCode, str] | None:
-    if response.status == "failed":
-        return LLMErrorCode.UNAVAILABLE, "The provider could not generate a response."
-    if response.status == "incomplete" and response.incomplete_details is not None:
-        match response.incomplete_details.reason:
-            case "max_output_tokens":
-                return LLMErrorCode.OUTPUT_LIMIT, "The output reached its token limit."
-            case "content_filter":
-                return LLMErrorCode.REFUSED, "The provider filtered the response."
-    if response.status != "completed":
+class _GroqMetadata(BaseModel):
+    id: str | None = None
+
+
+class _GroqCompletion(BaseModel):
+    object: Literal["chat.completion"]
+    id: str
+    model: str
+    choices: tuple[Choice]
+    usage: CompletionUsage | None = None
+    x_groq: _GroqMetadata | None = None
+
+
+def _response_failure(choice: Choice) -> tuple[LLMErrorCode, str] | None:
+    if choice.finish_reason == "length":
+        return LLMErrorCode.OUTPUT_LIMIT, "The output reached its token limit."
+    if choice.finish_reason == "content_filter" or choice.message.refusal is not None:
+        return LLMErrorCode.REFUSED, "The provider filtered or refused the response."
+    if choice.finish_reason != "stop":
         return LLMErrorCode.INCOMPLETE, "The provider returned an incomplete response."
-    if any(
-        part.type == "refusal"
-        for item in response.output
-        if item.type == "message"
-        for part in item.content
-    ):
-        return LLMErrorCode.REFUSED, "The model refused the request."
     return None
 
 
@@ -160,13 +163,15 @@ class LLMClient:
     ) -> None:
         self._settings = settings
         timeout = settings.timeout_seconds
+        if http_client is None:
+            http_client = DefaultHttpxClient(timeout=timeout)
+        http_client.follow_redirects = False
         self._client = OpenAI(
             api_key=settings.api_key.get_secret_value(),
             base_url=GROQ_BASE_URL,
             timeout=timeout,
             max_retries=0,
-            http_client=http_client
-            or DefaultHttpxClient(timeout=timeout, follow_redirects=False),
+            http_client=http_client,
         )
 
     def __enter__(self) -> Self:
@@ -215,15 +220,15 @@ class LLMClient:
             )
 
         try:
-            # Read the envelope before parsing model text, including partial JSON on truncation.
-            raw = self._client.responses.with_raw_response.parse(
+            # Defer content parsing until finish_reason and usage have been read.
+            raw = self._client.chat.completions.with_raw_response.parse(
                 model=settings.model,
-                instructions=instructions,
-                input=prompt,
-                text_format=schema,
-                max_output_tokens=settings.max_output_tokens,
-                service_tier="default",
-                store=False,
+                messages=[
+                    {"role": "system", "content": instructions},
+                    {"role": "user", "content": prompt},
+                ],
+                response_format=schema,
+                max_completion_tokens=settings.max_output_tokens,
             )
         except APITimeoutError:
             raise LLMError(
@@ -238,7 +243,9 @@ class LLMClient:
 
         request_id = raw.headers.get("x-request-id")
         try:
-            response = Response.model_validate_json(raw.content)
+            response = _GroqCompletion.model_validate_json(raw.content, strict=True)
+            if request_id is None and response.x_groq is not None:
+                request_id = response.x_groq.id
             usage = self._usage(response.usage)
         except ValueError:
             raise LLMError(
@@ -246,20 +253,21 @@ class LLMClient:
                 "The provider returned invalid response metadata.",
                 request_id=request_id,
             ) from None
+        (choice,) = response.choices
         logger.info(
             "LLM response model=%s request_id=%s status=%s usage=%s",
             response.model,
             request_id,
-            response.status,
+            choice.finish_reason,
             usage,
         )
-        if failure := _response_failure(response):
+        if failure := _response_failure(choice):
             raise LLMError(
                 *failure, request_id=request_id, usage=usage, model=response.model
             )
         try:
             output = schema.model_validate_json(
-                response.output_text, strict=True, extra="forbid"
+                choice.message.content or "", strict=True, extra="forbid"
             )
         except ValidationError:
             raise LLMError(
@@ -271,14 +279,19 @@ class LLMClient:
             ) from None
         return LLMResult(output, response.model, response.id, request_id, usage)
 
-    def _usage(self, data: ResponseUsage | None) -> LLMUsage | None:
+    def _usage(self, data: CompletionUsage | None) -> LLMUsage | None:
         if data is None:
             return None
-        cached = data.input_tokens_details.cached_tokens
+        details = data.prompt_tokens_details
+        cached = 0
+        if details is not None and details.cached_tokens is not None:
+            cached = details.cached_tokens
+        input_tokens = data.prompt_tokens
+        output_tokens = data.completion_tokens
         if (
-            not 0 <= cached <= data.input_tokens
-            or data.output_tokens < 0
-            or data.total_tokens != data.input_tokens + data.output_tokens
+            not 0 <= cached <= input_tokens
+            or output_tokens < 0
+            or data.total_tokens != input_tokens + output_tokens
         ):
             raise ValueError("Invalid token counts.")
 
@@ -288,10 +301,8 @@ class LLMClient:
         cost = None
         if input_price is not None and output_price is not None:
             cost = (
-                (data.input_tokens - cached) * input_price
+                (input_tokens - cached) * input_price
                 + cached * (input_price if cached_price is None else cached_price)
-                + data.output_tokens * output_price
+                + output_tokens * output_price
             ) / TOKENS_PER_MILLION
-        return LLMUsage(
-            data.input_tokens, cached, data.output_tokens, data.total_tokens, cost
-        )
+        return LLMUsage(input_tokens, cached, output_tokens, data.total_tokens, cost)

@@ -39,8 +39,8 @@ def test_ai_cli_summarizes_sql_report_without_changing_kpis(
 
     def respond(request: httpx.Request) -> httpx.Response:
         body = json.loads(request.content)
-        assert body["max_output_tokens"] == 3072
-        facts = json.loads(body["input"])
+        assert body["max_completion_tokens"] == 3072
+        facts = json.loads(body["messages"][1]["content"])
         assert facts["scopes"]["total"]["current"] == EXPECTED_STANDARD_KPIS
         assert "daily" not in facts
         assert (

@@ -20,7 +20,7 @@ AI-команды классифицируют обезличенные прич
 | Хранение и миграции | PostgreSQL 16, SQLAlchemy 2.x, psycopg 3, Alembic |
 | Аналитика и интерфейс | SQL, Streamlit, Altair |
 | Окружение, проверки и инфраструктура | uv, pytest, Ruff, Git/GitHub, Docker Compose |
-| AI | OpenAI Responses API, Structured Outputs / JSON Schema |
+| AI | GroqCloud, Qwen 3.8 27B, Chat Completions со строгой JSON Schema |
 | Планируемая автоматизация | n8n, Telegram Bot API |
 
 Backend — модульный монолит. PostgreSQL хранит события продаж, слой аналитики рассчитывает метрики, FastAPI отдаёт их через API, а Streamlit отображает результаты. LLM получает рассчитанные показатели и обезличенный текст. Подробнее в [архитектуре](docs/ARCHITECTURE.md).
