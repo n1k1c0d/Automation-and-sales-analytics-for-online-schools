@@ -64,10 +64,10 @@ def test_ai_cli_summarizes_sql_report_without_changing_kpis(
         return httpx.Response(200, json=_payload(json.dumps(plan)))
 
     for field in LLMSettings.model_fields:
-        monkeypatch.delenv(f"OPENAI_{field.upper()}", raising=False)
+        monkeypatch.delenv(f"GROQ_{field.upper()}", raising=False)
     monkeypatch.chdir(tmp_path)
-    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
-    monkeypatch.setenv("OPENAI_SUMMARY_MAX_OUTPUT_TOKENS", "3072")
+    monkeypatch.setenv("GROQ_API_KEY", "test-key")
+    monkeypatch.setenv("GROQ_SUMMARY_MAX_OUTPUT_TOKENS", "3072")
     monkeypatch.setattr(
         llm,
         "DefaultHttpxClient",

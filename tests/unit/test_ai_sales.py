@@ -37,7 +37,7 @@ CHALLENGE = FIXTURE.with_name("rejection_challenge_cases.json")
 @pytest.fixture(autouse=True)
 def isolate_llm_settings(monkeypatch: pytest.MonkeyPatch) -> None:
     for field in LLMSettings.model_fields:
-        monkeypatch.delenv(f"OPENAI_{field.upper()}", raising=False)
+        monkeypatch.delenv(f"GROQ_{field.upper()}", raising=False)
 
 
 def _client(plans: Iterable[dict], requests: list[dict] | None = None) -> LLMClient:
@@ -220,7 +220,7 @@ def test_evaluation_scores_labeled_examples_without_sending_the_labels() -> None
     assert len(evaluation.usage_by_request) == 2
     assert evaluation.output_limit_rate_pct == 0
     assert evaluation.by_category[RejectionReason.PRICE].wrong == 1
-    assert evaluation.settings.max_output_tokens == 1024
+    assert evaluation.settings.max_output_tokens == 2048
 
 
 def test_evaluation_counts_output_limits_without_repeating_batches() -> None:
@@ -252,14 +252,14 @@ def test_evaluation_counts_output_limits_without_repeating_batches() -> None:
     ) as client:
         report = evaluate_rejections(client, examples, batch_size=2)
     assert [len(batch) for batch in sent] == [2, 1]
-    assert report.settings.model == "gpt-5-mini"
+    assert report.settings.model == "qwen/qwen3.8-27b"
     assert report.settings.max_output_tokens == 2048
     assert report.correct == 1 and report.accuracy_pct == Decimal("33.33")
     assert report.output_limit_batches == 1 and report.output_limit_rate_pct == Decimal(
         "50.00"
     )
     assert [batch.status for batch in report.batches] == ["output_limit", "completed"]
-    assert report.batches[0].model == "gpt-5-mini-test"
+    assert report.batches[0].model == "qwen-test"
     assert report.batches[1].first_comment_id == 3
     assert report.by_category[RejectionReason.BANK_DECLINED].unclassified == 1
     assert report.by_category[RejectionReason.PRICE].correct == 1
@@ -279,7 +279,7 @@ def test_evaluation_cli_prints_json_and_returns_one_for_unclassified_batch(
     )
     payload = _payload(status="incomplete", reason="max_output_tokens")
     monkeypatch.chdir(tmp_path)
-    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    monkeypatch.setenv("GROQ_API_KEY", "test-key")
     monkeypatch.setattr(
         llm,
         "DefaultHttpxClient",

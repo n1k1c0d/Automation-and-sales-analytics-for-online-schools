@@ -24,7 +24,7 @@ if TYPE_CHECKING:
     from httpx import Client
 
 logger = logging.getLogger(__name__)
-OPENAI_BASE_URL = "https://api.openai.com/v1"
+GROQ_BASE_URL = "https://api.groq.com/openai/v1"
 TOKENS_PER_MILLION = Decimal(1_000_000)
 
 
@@ -162,7 +162,7 @@ class LLMClient:
         timeout = settings.timeout_seconds
         self._client = OpenAI(
             api_key=settings.api_key.get_secret_value(),
-            base_url=OPENAI_BASE_URL,
+            base_url=GROQ_BASE_URL,
             timeout=timeout,
             max_retries=0,
             http_client=http_client

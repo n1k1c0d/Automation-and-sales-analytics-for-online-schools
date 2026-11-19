@@ -73,7 +73,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         settings = LLMSettings()
     except ValidationError:
         print(
-            "Check the OPENAI settings in .env, including OPENAI_API_KEY.",
+            "Check the Groq settings in .env, including GROQ_API_KEY.",
             file=sys.stderr,
         )
         return 2
@@ -94,12 +94,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         if exc.code is LLMErrorCode.OUTPUT_LIMIT:
             if args.command == "classify":
                 print(
-                    "Try fewer comments per request or set OPENAI_CLASSIFICATION_MAX_OUTPUT_TOKENS.",
+                    "Try fewer comments per request or set GROQ_CLASSIFICATION_MAX_OUTPUT_TOKENS.",
                     file=sys.stderr,
                 )
             elif args.command == "summarize":
                 print(
-                    "Adjust OPENAI_SUMMARY_MAX_OUTPUT_TOKENS before running again.",
+                    "Adjust GROQ_SUMMARY_MAX_OUTPUT_TOKENS before running again.",
                     file=sys.stderr,
                 )
         if exc.request_id is not None:

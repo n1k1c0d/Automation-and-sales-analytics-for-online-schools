@@ -19,11 +19,11 @@ def main() -> int:
     except ValidationError as exc:
         fields = sorted(
             {
-                f"OPENAI_{str(item['loc'][0]).upper()}" if item["loc"] else "OPENAI_*"
+                f"GROQ_{str(item['loc'][0]).upper()}" if item["loc"] else "GROQ_*"
                 for item in exc.errors(include_input=False)
             }
         )
-        print(f"Check OpenAI settings in .env: {', '.join(fields)}.", file=sys.stderr)
+        print(f"Check Groq settings in .env: {', '.join(fields)}.", file=sys.stderr)
         return 2
 
     try:

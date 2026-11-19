@@ -23,7 +23,7 @@ class PostgresSettings(BaseSettings):
 
 class LLMSettings(BaseSettings):
     model_config = SettingsConfigDict(
-        env_prefix="OPENAI_",
+        env_prefix="GROQ_",
         env_file=".env",
         env_file_encoding="utf-8",
         env_ignore_empty=True,
@@ -33,10 +33,10 @@ class LLMSettings(BaseSettings):
     )
 
     api_key: SecretStr = Field(min_length=1)
-    model: str = Field(default="gpt-5-mini", min_length=1)
-    timeout_seconds: float = Field(default=30, gt=0, allow_inf_nan=False)
+    model: str = Field(default="qwen/qwen3.8-27b", min_length=1)
+    timeout_seconds: float = Field(default=60, gt=0, allow_inf_nan=False)
     max_input_chars: int = Field(default=24_000, gt=0)
-    max_output_tokens: int = Field(default=1_024, ge=16)
+    max_output_tokens: int = Field(default=2_048, ge=16)
     classification_max_output_tokens: int | None = Field(default=None, ge=16)
     summary_max_output_tokens: int | None = Field(default=None, ge=16)
     input_usd_per_million: Decimal | None = Field(
@@ -54,7 +54,7 @@ class LLMSettings(BaseSettings):
     def check_api_key(cls, value: SecretStr) -> SecretStr:
         key = value.get_secret_value().strip()
         if not key or not key.isascii() or not key.isprintable() or " " in key:
-            raise ValueError("OPENAI_API_KEY must be a non-empty token.")
+            raise ValueError("GROQ_API_KEY must be a non-empty token.")
         return SecretStr(key)
 
     @model_validator(mode="after")

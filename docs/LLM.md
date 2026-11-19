@@ -1,25 +1,25 @@
 # Клиент LLM
 
-`LLMClient` из `app/ai/client.py` обращается к OpenAI Responses API через официальный Python SDK. Метод `generate()` принимает инструкцию, текст запроса и модель ответа Pydantic. SDK передаёт строгую JSON Schema, затем клиент отдельно валидирует текст ответа. По умолчанию используется `gpt-5-mini`. [Structured Outputs](https://developers.openai.com/api/docs/guides/structured-outputs), [модель GPT-5 mini](https://developers.openai.com/api/docs/models/gpt-5-mini)
+В TASK-4.4.1 настройки AI переведены на GroqCloud. Клиент получает ключ и фиксированный базовый адрес Groq через совместимый Python SDK `openai`. Перевод вызова Responses API на Chat Completions запланирован в TASK-4.4.2. [Совместимость SDK](https://console.groq.com/docs/openai)
 
 ## Настройка
 
-Добавьте `OPENAI_API_KEY` в локальный `.env` или переменные окружения. Для работы из Python передайте `LLMSettings()` в `LLMClient`. [Получение ключа и первый запрос](https://developers.openai.com/api/docs/quickstart)
+Задайте `GROQ_API_KEY` в локальном `.env` или окружении процесса. Старые переменные `OPENAI_*` не используются для загрузки настроек `LLMSettings`. Для FastAPI, дашборда и SQL-отчёта ключ не требуется. [Управление ключами Groq](https://console.groq.com/keys)
 
 | Настройка | По умолчанию | Назначение |
 |---|---|---|
-| `OPENAI_API_KEY` | требуется для AI | Ключ проекта OpenAI. |
-| `OPENAI_MODEL` | `gpt-5-mini` | Модель с поддержкой Responses API и Structured Outputs. |
-| `OPENAI_TIMEOUT_SECONDS` | `30` | Таймаут сетевых операций в секундах. |
-| `OPENAI_MAX_INPUT_CHARS` | `24000` | Общий лимит символов инструкции и текста запроса. |
-| `OPENAI_MAX_OUTPUT_TOKENS` | `1024` | Базовый лимит токенов ответа, включая токены рассуждения. |
-| `OPENAI_CLASSIFICATION_MAX_OUTPUT_TOKENS` | базовый лимит | Необязательный лимит для классификации и оценки комментариев. |
-| `OPENAI_SUMMARY_MAX_OUTPUT_TOKENS` | базовый лимит | Необязательный лимит для сводок. |
-| `OPENAI_INPUT_USD_PER_MILLION` | пусто | Цена миллиона входных токенов выбранной модели. |
-| `OPENAI_CACHED_INPUT_USD_PER_MILLION` | пусто | Цена миллиона входных токенов, прочитанных из кэша. По умолчанию используется обычная входная цена. |
-| `OPENAI_OUTPUT_USD_PER_MILLION` | пусто | Цена миллиона выходных токенов выбранной модели. |
+| `GROQ_API_KEY` | требуется для AI | Ключ проекта Groq. |
+| `GROQ_MODEL` | `qwen/qwen3.8-27b` | Идентификатор облачной модели. |
+| `GROQ_TIMEOUT_SECONDS` | `60` | Таймаут сетевых операций в секундах. |
+| `GROQ_MAX_INPUT_CHARS` | `24000` | Общий лимит символов инструкции и текста запроса. |
+| `GROQ_MAX_OUTPUT_TOKENS` | `2048` | Базовый лимит токенов ответа. |
+| `GROQ_CLASSIFICATION_MAX_OUTPUT_TOKENS` | базовый лимит | Лимит для классификации и оценки комментариев. |
+| `GROQ_SUMMARY_MAX_OUTPUT_TOKENS` | базовый лимит | Лимит для сводок. |
+| `GROQ_INPUT_USD_PER_MILLION` | пусто | Цена миллиона входных токенов выбранной модели. |
+| `GROQ_CACHED_INPUT_USD_PER_MILLION` | пусто | Цена миллиона кэшированных входных токенов. По умолчанию применяется обычная входная цена. |
+| `GROQ_OUTPUT_USD_PER_MILLION` | пусто | Цена миллиона выходных токенов выбранной модели. |
 
-Запросы отправляются на стандартном уровне обслуживания с `store=false`, чтобы отключить сохранение ответа для последующего получения через API. Каждому вызову соответствует одна попытка, а сетевые ошибки передаются вызывающему коду. [Параметры Responses API](https://developers.openai.com/api/reference/resources/responses/methods/create)
+В `.env.example` для классификации и сводок явно заданы стартовые значения по 2048. Удалите или оставьте пустой настройку отдельной операции, чтобы она наследовала базовый лимит.
 
 ## Результат и расходы
 
@@ -35,8 +35,8 @@
 uv run --locked python -m pytest tests/unit/test_llm_client.py -q
 ```
 
-Для ручной проверки с настроенным ключом выполните команду ниже. Она делает один тарифицируемый запрос с коротким синтетическим сообщением и выводит результат и статистику токенов.
+Проверить чтение локального ключа и вывести модель без обращения к API можно из корня проекта.
 
 ```powershell
-uv run --locked python -m scripts.check_llm
+uv run --locked python -c "from app.core.config import LLMSettings; print(LLMSettings().model)"
 ```

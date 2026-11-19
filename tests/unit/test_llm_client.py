@@ -10,8 +10,9 @@ import pytest
 from pydantic import BaseModel, ValidationError
 
 from app.ai import client as llm
-from app.ai.client import LLMClient, LLMError, LLMErrorCode, LLMUsage
-from app.core.config import LLMSettings
+from app.ai.client import LLMClient, LLMError, LLMErrorCode, LLMOperation, LLMUsage
+from app.core.config import LLMSettings, PostgresSettings
+from scripts.ai_sales import main as ai_sales
 from scripts.check_llm import main as check_llm
 
 KEY = "unit-test-token"
@@ -27,7 +28,7 @@ class StructuredStatus(BaseModel):
 @pytest.fixture(autouse=True)
 def isolate_settings(monkeypatch: pytest.MonkeyPatch) -> None:
     for field in LLMSettings.model_fields:
-        monkeypatch.delenv(f"OPENAI_{field.upper()}", raising=False)
+        monkeypatch.delenv(f"GROQ_{field.upper()}", raising=False)
 
 
 def _settings(**overrides) -> LLMSettings:
@@ -51,7 +52,7 @@ def _payload(
         "object": "response",
         "created_at": 0,
         "status": status,
-        "model": "gpt-5-mini-test",
+        "model": "qwen-test",
         "incomplete_details": {"reason": reason} if reason else None,
         "output": [
             {"id": "rs_test", "type": "reasoning", "summary": []},
@@ -92,8 +93,9 @@ def test_uses_strict_structured_outputs_and_accounts_for_usage(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     monkeypatch.setenv("OPENAI_BASE_URL", "https://elsewhere.invalid/v1")
+    monkeypatch.setenv("GROQ_BASE_URL", "https://elsewhere.invalid/v1")
+    monkeypatch.setenv("OPENAI_API_KEY", "unused-openai-key")
     options = _settings(
-        model="gpt-5-mini",
         timeout_seconds=1.25,
         max_output_tokens=256,
         input_usd_per_million="2",
@@ -112,11 +114,11 @@ def test_uses_strict_structured_outputs_and_accounts_for_usage(
     ):
         result = _generate(client)
     (request,) = requests
-    assert str(request.url) == "https://api.openai.com/v1/responses"
+    assert str(request.url) == "https://api.groq.com/openai/v1/responses"
     assert request.headers["authorization"] == f"Bearer {KEY}"
     assert set(request.extensions["timeout"].values()) == {1.25}
     body = json.loads(request.content)
-    assert body["model"] == "gpt-5-mini"
+    assert body["model"] == "qwen/qwen3.8-27b"
     assert body["input"] == "A synthetic prompt."
     assert body["instructions"] == "Return the requested status."
     assert body["max_output_tokens"] == 256
@@ -302,11 +304,48 @@ def test_settings_load_from_dotenv_and_mask_the_key(
 ) -> None:
     monkeypatch.chdir(tmp_path)
     Path(".env").write_text(
-        f"OPENAI_API_KEY={KEY}\nOPENAI_MODEL=llm-test\n", encoding="utf-8"
+        f"GROQ_API_KEY={KEY}\nGROQ_MODEL=llm-test\n"
+        "POSTGRES_USER=test-user\nPOSTGRES_DB=test-db\nPOSTGRES_PASSWORD=test-password\n",
+        encoding="utf-8",
     )
+    for field in PostgresSettings.model_fields:
+        monkeypatch.delenv(f"POSTGRES_{field.upper()}", raising=False)
     settings = LLMSettings()
     assert settings.model == "llm-test" and settings.api_key.get_secret_value() == KEY
     assert KEY not in repr(settings)
+    postgres = PostgresSettings()
+    assert postgres.db == "test-db" and postgres.user == "test-user"
+
+
+def test_groq_limits_and_independent_operation_overrides(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("OPENAI_MODEL", "unused-model")
+    monkeypatch.setenv("OPENAI_MAX_OUTPUT_TOKENS", "8192")
+    with LLMClient(_settings()) as client:
+        for operation in (None, LLMOperation.CLASSIFICATION, LLMOperation.SUMMARY):
+            settings = client.request_settings(operation)
+            assert settings.model == "qwen/qwen3.8-27b"
+            assert settings.timeout_seconds == 60
+            assert settings.max_input_chars == 24_000
+            assert settings.max_output_tokens == 2_048
+
+    monkeypatch.setenv("GROQ_MAX_OUTPUT_TOKENS", "3072")
+    monkeypatch.setenv("GROQ_SUMMARY_MAX_OUTPUT_TOKENS", "4096")
+    with LLMClient(_settings()) as client:
+        assert (
+            client.request_settings(LLMOperation.CLASSIFICATION).max_output_tokens
+            == 3072
+        )
+        assert client.request_settings(LLMOperation.SUMMARY).max_output_tokens == 4096
+
+
+def test_invalid_groq_key_is_masked(monkeypatch: pytest.MonkeyPatch) -> None:
+    invalid_key = "test key with spaces"
+    monkeypatch.setenv("GROQ_API_KEY", invalid_key)
+    with pytest.raises(ValidationError, match="GROQ_API_KEY") as caught:
+        LLMSettings(_env_file=None)
+    assert invalid_key not in str(caught.value)
 
 
 def test_incomplete_price_config_is_rejected() -> None:
@@ -321,7 +360,7 @@ def test_check_command_reads_environment_and_prints_usage(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     monkeypatch.chdir(tmp_path)
-    monkeypatch.setenv("OPENAI_API_KEY", KEY)
+    monkeypatch.setenv("GROQ_API_KEY", KEY)
     monkeypatch.setattr(
         llm,
         "DefaultHttpxClient",
@@ -339,10 +378,24 @@ def test_check_command_reads_environment_and_prints_usage(
     assert KEY not in output.out and not output.err
 
 
-def test_check_command_reports_missing_key(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+@pytest.mark.parametrize("legacy_key", [False, True])
+def test_ai_commands_require_groq_key(
+    legacy_key: bool,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     monkeypatch.chdir(tmp_path)
+    if legacy_key:
+        monkeypatch.setenv("OPENAI_API_KEY", KEY)
+        Path(".env").write_text(f"OPENAI_API_KEY={KEY}\n", encoding="utf-8")
+    else:
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    with pytest.raises(ValidationError) as caught:
+        LLMSettings()
+    assert caught.value.errors(include_input=False)[0]["type"] == "missing"
     assert check_llm() == 2
+    assert ai_sales(["evaluate"]) == 2
     output = capsys.readouterr()
-    assert not output.out and "OPENAI_API_KEY" in output.err
+    assert not output.out and output.err.count("GROQ_API_KEY") == 2
+    assert KEY not in output.err
