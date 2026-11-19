@@ -552,6 +552,7 @@ def test_check_command_reads_environment_and_prints_usage(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     monkeypatch.setenv("GROQ_API_KEY", KEY)
     monkeypatch.setattr(
         llm,
@@ -591,3 +592,19 @@ def test_ai_commands_require_groq_key(
     output = capsys.readouterr()
     assert not output.out and output.err.count("GROQ_API_KEY") == 2
     assert KEY not in output.err
+
+
+def test_cli_identifies_invalid_groq_setting_without_printing_its_value(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("GROQ_API_KEY", KEY)
+    monkeypatch.setenv("GROQ_SUMMARY_MAX_OUTPUT_TOKENS", "private-invalid-value")
+    assert check_llm() == 2
+    assert ai_sales(["evaluate"]) == 2
+    output = capsys.readouterr()
+    assert not output.out
+    assert (
+        output.err.splitlines()
+        == ["Check Groq settings in .env: GROQ_SUMMARY_MAX_OUTPUT_TOKENS."] * 2
+    )

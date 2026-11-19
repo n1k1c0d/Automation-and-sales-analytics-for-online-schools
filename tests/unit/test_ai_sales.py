@@ -30,6 +30,7 @@ from app.schemas.sales_report import (
     SourceSalesMetrics,
 )
 from scripts.ai_sales import main as ai_sales_main
+from scripts.check_llm import main as check_llm
 from tests.unit.test_llm_client import REQUEST_HEADERS, _payload
 
 FIXTURE = Path(__file__).resolve().parents[2] / "data/synthetic/ai/rejection_cases.json"
@@ -299,29 +300,90 @@ def test_evaluation_counts_output_limits_without_repeating_batches() -> None:
     ]
 
 
-def test_evaluation_cli_prints_json_and_returns_one_for_unclassified_batch(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+@pytest.mark.parametrize(
+    ("args", "schema", "limit_env", "expected_limit"),
+    [
+        ([], "ConnectionCheck", "GROQ_MAX_OUTPUT_TOKENS", 256),
+        (
+            ["classify", "comments.json"],
+            "ClassificationPlan",
+            "GROQ_CLASSIFICATION_MAX_OUTPUT_TOKENS",
+            512,
+        ),
+        (
+            ["evaluate", "cases.json", "--batch-size", "4"],
+            "ClassificationPlan",
+            "GROQ_CLASSIFICATION_MAX_OUTPUT_TOKENS",
+            512,
+        ),
+        (
+            ["summarize", "report.json"],
+            "SummaryPlan",
+            "GROQ_SUMMARY_MAX_OUTPUT_TOKENS",
+            1024,
+        ),
+        (
+            ["ask", "report.json", "Сколько лидов?"],
+            "QuestionPlan",
+            "GROQ_MAX_OUTPUT_TOKENS",
+            256,
+        ),
+    ],
+)
+def test_cli_uses_groq_and_reports_the_effective_limit(
+    args: list[str],
+    schema: str,
+    limit_env: str,
+    expected_limit: int,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
-    path = tmp_path / "cases.json"
-    path.write_text(
-        json.dumps([{"comment": "Причину не указали.", "expected": "unclear"}]),
-        encoding="utf-8",
-    )
-    payload = _payload(finish_reason="length")
     monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     monkeypatch.setenv("GROQ_API_KEY", "test-key")
+    monkeypatch.setenv("GROQ_MAX_OUTPUT_TOKENS", "256")
+    monkeypatch.setenv("GROQ_CLASSIFICATION_MAX_OUTPUT_TOKENS", "512")
+    monkeypatch.setenv("GROQ_SUMMARY_MAX_OUTPUT_TOKENS", "1024")
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        assert str(request.url) == "https://api.groq.com/openai/v1/chat/completions"
+        assert request.headers["Authorization"] == "Bearer test-key"
+        body = json.loads(request.content)
+        assert body["model"] == "qwen/qwen3.8-27b"
+        assert body["response_format"]["json_schema"]["name"] == schema
+        assert body["max_completion_tokens"] == expected_limit
+        return httpx.Response(200, json=_payload(finish_reason="length"))
+
     monkeypatch.setattr(
         llm,
         "DefaultHttpxClient",
-        lambda **_: httpx.Client(
-            transport=httpx.MockTransport(lambda _: httpx.Response(200, json=payload))
-        ),
+        lambda **_: httpx.Client(transport=httpx.MockTransport(respond)),
     )
-    assert ai_sales_main(["evaluate", str(path), "--batch-size", "4"]) == 1
-    result = json.loads(capsys.readouterr().out)
-    assert result["batch_size"] == 4
-    assert result["output_limit_batches"] == 1
-    assert result["by_category"]["unclear"]["unclassified"] == 1
+    comment = "Причину не указали."
+    inputs = {
+        "comments.json": [comment],
+        "cases.json": [{"comment": comment, "expected": "unclear"}],
+        "report.json": _report(6, _metrics(leads=3)).model_dump(mode="json"),
+    }
+    for filename, data in inputs.items():
+        (tmp_path / filename).write_text(json.dumps(data), encoding="utf-8-sig")
+    exit_code = ai_sales_main(args) if args else check_llm()
+
+    output = capsys.readouterr()
+    assert limit_env in output.err
+    assert "test-key" not in output.err
+    if args[:1] == ["evaluate"]:
+        assert exit_code == 1
+        assert "--batch-size" in output.err
+        result = json.loads(output.out)
+        assert result["batch_size"] == 4
+        assert result["output_limit_batches"] == 1
+        assert result["by_category"]["unclear"]["unclassified"] == 1
+    else:
+        assert exit_code == 2
+        assert "output_limit" in output.err
+        assert not output.out
 
 
 def _metrics(**values) -> SalesMetrics:

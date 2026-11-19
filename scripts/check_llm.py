@@ -5,8 +5,9 @@ from typing import Literal
 
 from pydantic import BaseModel, ValidationError
 
-from app.ai.client import LLMClient, LLMError
+from app.ai.client import LLMClient, LLMError, LLMErrorCode
 from app.core.config import LLMSettings
+from scripts._llm_cli import result_payload, settings_error_message
 
 
 class ConnectionCheck(BaseModel):
@@ -17,42 +18,29 @@ def main() -> int:
     try:
         settings = LLMSettings()
     except ValidationError as exc:
-        fields = sorted(
-            {
-                f"GROQ_{str(item['loc'][0]).upper()}" if item["loc"] else "GROQ_*"
-                for item in exc.errors(include_input=False)
-            }
-        )
-        print(f"Check Groq settings in .env: {', '.join(fields)}.", file=sys.stderr)
+        print(settings_error_message(exc), file=sys.stderr)
         return 2
 
     try:
         with LLMClient(settings) as client:
             result = client.generate(
-                instructions="Set the status field to ok.",
+                instructions='Return the JSON object {"status":"ok"} for this check.',
                 prompt="Run a synthetic connectivity check for EduFlow AI.",
                 schema=ConnectionCheck,
             )
     except LLMError as exc:
-        print(f"LLM check failed ({exc.code}): {exc}", file=sys.stderr)
+        print(f"Groq check failed ({exc.code}): {exc}", file=sys.stderr)
+        if exc.code is LLMErrorCode.OUTPUT_LIMIT:
+            print(
+                "Adjust GROQ_MAX_OUTPUT_TOKENS before running again.", file=sys.stderr
+            )
         if exc.request_id is not None:
             print(f"Request ID: {exc.request_id}", file=sys.stderr)
         if exc.usage is not None:
             print(json.dumps(asdict(exc.usage), default=str), file=sys.stderr)
         return 2
 
-    print(
-        json.dumps(
-            {
-                "output": result.output.model_dump(mode="json"),
-                "model": result.model,
-                "response_id": result.response_id,
-                "request_id": result.request_id,
-                "usage": asdict(result.usage) if result.usage is not None else None,
-            },
-            default=str,
-        )
-    )
+    print(json.dumps(result_payload(result), default=str))
     return 0
 
 

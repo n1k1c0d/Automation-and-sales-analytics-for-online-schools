@@ -17,13 +17,20 @@ from app.ai.rejections import (
 )
 from app.ai.sales_analysis import Report, answer_sales_question, summarize_sales
 from app.core.config import LLMSettings
+from scripts._llm_cli import result_payload, settings_error_message
 
 LABELED_FIXTURE = Path("data/synthetic/ai/rejection_cases.json")
+OUTPUT_LIMIT_HINTS = {
+    "classify": "Try fewer comments per request or set GROQ_CLASSIFICATION_MAX_OUTPUT_TOKENS.",
+    "evaluate": "Reduce --batch-size or set GROQ_CLASSIFICATION_MAX_OUTPUT_TOKENS.",
+    "summarize": "Adjust GROQ_SUMMARY_MAX_OUTPUT_TOKENS before running again.",
+    "ask": "Adjust GROQ_MAX_OUTPUT_TOKENS before running again.",
+}
 
 
 def _arguments(argv: Sequence[str] | None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Analyze anonymized sales data with an LLM."
+        description="Analyze anonymized sales data with GroqCloud."
     )
     commands = parser.add_subparsers(dest="command", required=True)
     classify = commands.add_parser(
@@ -71,11 +78,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = _arguments(argv)
     try:
         settings = LLMSettings()
-    except ValidationError:
-        print(
-            "Check the Groq settings in .env, including GROQ_API_KEY.",
-            file=sys.stderr,
-        )
+    except ValidationError as exc:
+        print(settings_error_message(exc), file=sys.stderr)
         return 2
     try:
         with LLMClient(settings) as client:
@@ -90,18 +94,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(str(exc), file=sys.stderr)
         return 2
     except LLMError as exc:
-        print(f"AI analysis failed ({exc.code}) — {exc}", file=sys.stderr)
+        print(f"Groq analysis failed ({exc.code}) — {exc}", file=sys.stderr)
         if exc.code is LLMErrorCode.OUTPUT_LIMIT:
-            if args.command == "classify":
-                print(
-                    "Try fewer comments per request or set GROQ_CLASSIFICATION_MAX_OUTPUT_TOKENS.",
-                    file=sys.stderr,
-                )
-            elif args.command == "summarize":
-                print(
-                    "Adjust GROQ_SUMMARY_MAX_OUTPUT_TOKENS before running again.",
-                    file=sys.stderr,
-                )
+            print(OUTPUT_LIMIT_HINTS[args.command], file=sys.stderr)
         if exc.request_id is not None:
             print(f"Request ID {exc.request_id}", file=sys.stderr)
         if exc.usage is not None:
@@ -109,17 +104,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 2
 
     if isinstance(result, LLMResult):
-        output = {
-            "output": result.output.model_dump(mode="json"),
-            "model": result.model,
-            "response_id": result.response_id,
-            "request_id": result.request_id,
-            "usage": asdict(result.usage) if result.usage is not None else None,
-        }
+        output = result_payload(result)
     else:
         output = result.model_dump(mode="json")
     print(json.dumps(output, default=str, indent=2))
     if isinstance(result, ClassificationEvaluation) and result.output_limit_batches:
+        print(OUTPUT_LIMIT_HINTS["evaluate"], file=sys.stderr)
         return 1
     return 0
 
