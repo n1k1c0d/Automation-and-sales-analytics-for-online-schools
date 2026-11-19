@@ -37,6 +37,8 @@ class LLMSettings(BaseSettings):
     timeout_seconds: float = Field(default=30, gt=0, allow_inf_nan=False)
     max_input_chars: int = Field(default=24_000, gt=0)
     max_output_tokens: int = Field(default=1_024, ge=16)
+    classification_max_output_tokens: int | None = Field(default=None, ge=16)
+    summary_max_output_tokens: int | None = Field(default=None, ge=16)
     input_usd_per_million: Decimal | None = Field(
         default=None, ge=0, allow_inf_nan=False
     )

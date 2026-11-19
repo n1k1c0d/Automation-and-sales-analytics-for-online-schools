@@ -6,7 +6,7 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict
 
-from app.ai.client import LLMClient, LLMResult
+from app.ai.client import LLMClient, LLMOperation, LLMResult
 from app.schemas.sales_report import (
     ReportPeriod,
     SalesMetrics,
@@ -303,15 +303,25 @@ def _analysis(
     hypotheses: list[HypothesisCheck] | None = None,
     ranking_line: str | None = None,
 ) -> Analysis:
+    if not any(
+        item.current is not None or item.comparison is not None for item in observations
+    ):
+        return Analysis(
+            status="insufficient_data",
+            current_period=context.current.period,
+            comparison_period=context.comparison.period if context.comparison else None,
+            filters=context.filters,
+            lines=["Недостаточно данных для ответа."],
+            observations=[],
+            hypotheses=[],
+        )
     lines = [
         _line(item, compare=context.comparison is not None) for item in observations
     ]
-    if not observations:
-        lines = ["В отчёте недостаточно данных для ответа."]
     if ranking_line is not None:
         lines.insert(0, ranking_line)
     return Analysis(
-        status="answered" if observations else "insufficient_data",
+        status="answered",
         current_period=context.current.period,
         comparison_period=context.comparison.period if context.comparison else None,
         filters=context.filters,
@@ -331,6 +341,7 @@ def summarize_sales(client: LLMClient, report: Report) -> LLMResult[Analysis]:
         instructions=SUMMARY_INSTRUCTIONS,
         prompt=json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
         schema=SummaryPlan,
+        operation=LLMOperation.SUMMARY,
     )
     observations = _resolve(result, context, result.output.metrics)
     selected = {
@@ -425,11 +436,6 @@ def answer_sales_question(
             ranking_line = f"{order} среди срезов отчёта в {period}."
     else:
         observations = _resolve(result, context, plan.metrics)
-        if not any(
-            item.current is not None or item.comparison is not None
-            for item in observations
-        ):
-            observations = []
     return result.with_output(
         _analysis(context, observations, ranking_line=ranking_line)
     )

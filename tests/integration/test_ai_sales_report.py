@@ -39,6 +39,7 @@ def test_ai_cli_summarizes_sql_report_without_changing_kpis(
 
     def respond(request: httpx.Request) -> httpx.Response:
         body = json.loads(request.content)
+        assert body["max_output_tokens"] == 3072
         facts = json.loads(body["input"])
         assert facts["scopes"]["total"]["current"] == EXPECTED_STANDARD_KPIS
         assert "daily" not in facts
@@ -66,6 +67,7 @@ def test_ai_cli_summarizes_sql_report_without_changing_kpis(
         monkeypatch.delenv(f"OPENAI_{field.upper()}", raising=False)
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    monkeypatch.setenv("OPENAI_SUMMARY_MAX_OUTPUT_TOKENS", "3072")
     monkeypatch.setattr(
         llm,
         "DefaultHttpxClient",

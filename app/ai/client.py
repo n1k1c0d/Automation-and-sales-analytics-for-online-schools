@@ -42,6 +42,19 @@ class LLMErrorCode(StrEnum):
     INCOMPLETE = "incomplete"
 
 
+class LLMOperation(StrEnum):
+    CLASSIFICATION = "classification"
+    SUMMARY = "summary"
+
+
+@dataclass(frozen=True, slots=True)
+class LLMRequestSettings:
+    model: str
+    max_output_tokens: int
+    max_input_chars: int
+    timeout_seconds: float
+
+
 @dataclass(frozen=True, slots=True)
 class LLMUsage:
     input_tokens: int
@@ -70,6 +83,7 @@ class LLMResult[OutputT: BaseModel]:
             message,
             request_id=self.request_id,
             usage=self.usage,
+            model=self.model,
         )
 
 
@@ -81,11 +95,13 @@ class LLMError(Exception):
         *,
         request_id: str | None = None,
         usage: LLMUsage | None = None,
+        model: str | None = None,
     ) -> None:
         super().__init__(message)
         self.code = code
         self.request_id = request_id
         self.usage = usage
+        self.model = model
 
 
 def _status_error(error: APIStatusError) -> LLMError:
@@ -164,18 +180,35 @@ class LLMClient:
     ) -> None:
         self._client.close()
 
+    def request_settings(
+        self, operation: LLMOperation | None = None
+    ) -> LLMRequestSettings:
+        settings = self._settings
+        limits = {
+            LLMOperation.CLASSIFICATION: settings.classification_max_output_tokens,
+            LLMOperation.SUMMARY: settings.summary_max_output_tokens,
+        }
+        return LLMRequestSettings(
+            model=settings.model,
+            max_output_tokens=limits.get(operation) or settings.max_output_tokens,
+            max_input_chars=settings.max_input_chars,
+            timeout_seconds=settings.timeout_seconds,
+        )
+
     def generate[OutputT: BaseModel](
         self,
         *,
         instructions: str,
         prompt: str,
         schema: type[OutputT],
+        operation: LLMOperation | None = None,
     ) -> LLMResult[OutputT]:
         if not instructions.strip() or not prompt.strip():
             raise LLMError(
                 LLMErrorCode.INVALID_INPUT, "Instructions and prompt must be non-empty."
             )
-        if len(instructions) + len(prompt) > self._settings.max_input_chars:
+        settings = self.request_settings(operation)
+        if len(instructions) + len(prompt) > settings.max_input_chars:
             raise LLMError(
                 LLMErrorCode.INVALID_INPUT,
                 "The input exceeds the configured character limit.",
@@ -184,11 +217,11 @@ class LLMClient:
         try:
             # Read the envelope before parsing model text, including partial JSON on truncation.
             raw = self._client.responses.with_raw_response.parse(
-                model=self._settings.model,
+                model=settings.model,
                 instructions=instructions,
                 input=prompt,
                 text_format=schema,
-                max_output_tokens=self._settings.max_output_tokens,
+                max_output_tokens=settings.max_output_tokens,
                 service_tier="default",
                 store=False,
             )
@@ -221,7 +254,9 @@ class LLMClient:
             usage,
         )
         if failure := _response_failure(response):
-            raise LLMError(*failure, request_id=request_id, usage=usage)
+            raise LLMError(
+                *failure, request_id=request_id, usage=usage, model=response.model
+            )
         try:
             output = schema.model_validate_json(
                 response.output_text, strict=True, extra="forbid"
@@ -232,6 +267,7 @@ class LLMClient:
                 "The generated output does not match the requested schema.",
                 request_id=request_id,
                 usage=usage,
+                model=response.model,
             ) from None
         return LLMResult(output, response.model, response.id, request_id, usage)
 

@@ -7,8 +7,14 @@ from pathlib import Path
 
 from pydantic import BaseModel, TypeAdapter, ValidationError
 
-from app.ai.client import LLMClient, LLMError, LLMResult
-from app.ai.rejections import LabeledComment, classify_rejections, evaluate_rejections
+from app.ai.client import LLMClient, LLMError, LLMErrorCode, LLMResult
+from app.ai.rejections import (
+    MAX_COMMENTS,
+    ClassificationEvaluation,
+    LabeledComment,
+    classify_rejections,
+    evaluate_rejections,
+)
 from app.ai.sales_analysis import Report, answer_sales_question, summarize_sales
 from app.core.config import LLMSettings
 
@@ -28,6 +34,12 @@ def _arguments(argv: Sequence[str] | None) -> argparse.Namespace:
         "evaluate", help="Score classification on labeled examples."
     )
     evaluate.add_argument("file", type=Path, nargs="?", default=LABELED_FIXTURE)
+    evaluate.add_argument(
+        "--batch-size",
+        type=int,
+        choices=range(1, MAX_COMMENTS + 1),
+        default=MAX_COMMENTS,
+    )
     summarize = commands.add_parser(
         "summarize", help="Summarize a sales_report JSON file."
     )
@@ -47,7 +59,7 @@ def _run(client: LLMClient, args: argparse.Namespace) -> LLMResult | BaseModel:
         return classify_rejections(client, comments)
     if args.command == "evaluate":
         examples = TypeAdapter(list[LabeledComment]).validate_json(data)
-        return evaluate_rejections(client, examples)
+        return evaluate_rejections(client, examples, batch_size=args.batch_size)
 
     report = TypeAdapter(Report).validate_json(data)
     if args.command == "summarize":
@@ -79,6 +91,17 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 2
     except LLMError as exc:
         print(f"AI analysis failed ({exc.code}) — {exc}", file=sys.stderr)
+        if exc.code is LLMErrorCode.OUTPUT_LIMIT:
+            if args.command == "classify":
+                print(
+                    "Try fewer comments per request or set OPENAI_CLASSIFICATION_MAX_OUTPUT_TOKENS.",
+                    file=sys.stderr,
+                )
+            elif args.command == "summarize":
+                print(
+                    "Adjust OPENAI_SUMMARY_MAX_OUTPUT_TOKENS before running again.",
+                    file=sys.stderr,
+                )
         if exc.request_id is not None:
             print(f"Request ID {exc.request_id}", file=sys.stderr)
         if exc.usage is not None:
@@ -96,6 +119,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     else:
         output = result.model_dump(mode="json")
     print(json.dumps(output, default=str, indent=2))
+    if isinstance(result, ClassificationEvaluation) and result.output_limit_batches:
+        return 1
     return 0
 
 

@@ -12,7 +12,9 @@
 | `OPENAI_MODEL` | `gpt-5-mini` | Модель с поддержкой Responses API и Structured Outputs. |
 | `OPENAI_TIMEOUT_SECONDS` | `30` | Таймаут сетевых операций в секундах. |
 | `OPENAI_MAX_INPUT_CHARS` | `24000` | Общий лимит символов инструкции и текста запроса. |
-| `OPENAI_MAX_OUTPUT_TOKENS` | `1024` | Лимит токенов ответа, включая токены рассуждения. |
+| `OPENAI_MAX_OUTPUT_TOKENS` | `1024` | Базовый лимит токенов ответа, включая токены рассуждения. |
+| `OPENAI_CLASSIFICATION_MAX_OUTPUT_TOKENS` | базовый лимит | Необязательный лимит для классификации и оценки комментариев. |
+| `OPENAI_SUMMARY_MAX_OUTPUT_TOKENS` | базовый лимит | Необязательный лимит для сводок. |
 | `OPENAI_INPUT_USD_PER_MILLION` | пусто | Цена миллиона входных токенов выбранной модели. |
 | `OPENAI_CACHED_INPUT_USD_PER_MILLION` | пусто | Цена миллиона входных токенов, прочитанных из кэша. По умолчанию используется обычная входная цена. |
 | `OPENAI_OUTPUT_USD_PER_MILLION` | пусто | Цена миллиона выходных токенов выбранной модели. |

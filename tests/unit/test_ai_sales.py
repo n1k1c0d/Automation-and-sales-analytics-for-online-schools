@@ -8,7 +8,9 @@ import httpx
 import pytest
 from pydantic import TypeAdapter
 
+from app.ai import client as llm
 from app.ai.client import LLMClient, LLMError, LLMErrorCode
+from app.ai.comment_privacy import CommentPrivacyError, check_comment_privacy
 from app.ai.rejections import (
     MAX_COMMENTS,
     LabeledComment,
@@ -25,9 +27,11 @@ from app.schemas.sales_report import (
     SalesReportComparison,
     SourceSalesMetrics,
 )
+from scripts.ai_sales import main as ai_sales_main
 from tests.unit.test_llm_client import REQUEST_HEADERS, _payload
 
 FIXTURE = Path(__file__).resolve().parents[2] / "data/synthetic/ai/rejection_cases.json"
+CHALLENGE = FIXTURE.with_name("rejection_challenge_cases.json")
 
 
 @pytest.fixture(autouse=True)
@@ -86,6 +90,70 @@ def test_classification_preserves_input_order_and_calculates_counts() -> None:
             {"comment_id": 2, "comment": "Причину не сообщили."},
         ]
     ]
+
+
+@pytest.mark.parametrize(
+    ("comment", "category"),
+    [
+        ("Перезвонить на +7 (900) 000-00-00.", "phone"),
+        ("Номер для связи 89000000000.", "phone"),
+        ("Позвонить на (202) 555-0149.", "phone"),
+        ("Ответить на learner@example.test.", "email"),
+        ("Почта learner＠example.test", "email"),
+        ("Клиент Иван Тестов отказался от курса.", "name"),
+        ("ФИО: учбов условный", "name"),
+        ("Курс не подошёл Сергею. Заявитель Б. Б. Примеров.", "name"),
+    ],
+)
+def test_classification_blocks_personal_data_before_http(
+    comment: str, category: str
+) -> None:
+    sent = []
+    with _client([], sent) as client, pytest.raises(CommentPrivacyError) as caught:
+        classify_rejections(client, ["Цена не подошла.", comment])
+    (finding,) = caught.value.findings
+    assert finding.comment_id == 2
+    assert finding.categories == (category,)
+    assert not sent
+    assert comment not in str(caught.value)
+
+
+def test_normalized_obscured_email_is_blocked() -> None:
+    with pytest.raises(CommentPrivacyError, match=r"1 \(email\)"):
+        check_comment_privacy(["Контакт learner\u200b@example.test."])
+
+
+def test_evaluation_blocks_whole_file_before_first_batch() -> None:
+    safe = LabeledComment(comment="Курс слишком дорогой.", expected="price")
+    sensitive = LabeledComment(
+        comment="Отказ по почте learner@example.test.", expected="unclear"
+    )
+    sent = []
+    with (
+        _client([], sent) as client,
+        pytest.raises(CommentPrivacyError, match=r"9 \(email\)"),
+    ):
+        evaluate_rejections(client, [safe] * MAX_COMMENTS + [sensitive])
+    assert not sent
+
+
+def test_privacy_filter_allows_synthetic_business_data() -> None:
+    adapter = TypeAdapter(list[LabeledComment])
+    standard = adapter.validate_json(FIXTURE.read_bytes())
+    challenge = adapter.validate_json(CHALLENGE.read_bytes())
+    assert len(standard) == 18 and len(challenge) == 24
+    check_comment_privacy(
+        [case.comment for case in standard + challenge]
+        + ["Банк Открытие спросил про цену 120 000 ₽. Встреча 2026-06-01 12:00."]
+    )
+    labels = {case.expected for case in challenge}
+    assert {
+        RejectionReason.UNCLEAR,
+        RejectionReason.BANK_DECLINED,
+        RejectionReason.FINANCING_TERMS,
+        RejectionReason.PRICE,
+        RejectionReason.POSTPONED,
+    } <= labels
 
 
 @pytest.mark.parametrize(
@@ -150,6 +218,80 @@ def test_evaluation_scores_labeled_examples_without_sending_the_labels() -> None
     assert [len(batch) for batch in sent] == [8, 1]
     assert all(set(row) == {"comment_id", "comment"} for batch in sent for row in batch)
     assert len(evaluation.usage_by_request) == 2
+    assert evaluation.output_limit_rate_pct == 0
+    assert evaluation.by_category[RejectionReason.PRICE].wrong == 1
+    assert evaluation.settings.max_output_tokens == 1024
+
+
+def test_evaluation_counts_output_limits_without_repeating_batches() -> None:
+    sent = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        assert body["max_output_tokens"] == 2048
+        sent.append(json.loads(body["input"]))
+        if len(sent) == 1:
+            payload = _payload(
+                '{"classifications":', status="incomplete", reason="max_output_tokens"
+            )
+        else:
+            plan = _classification_reply(_classification(1, "price", "дорого"))
+            payload = _payload(json.dumps(plan))
+        return httpx.Response(200, headers=REQUEST_HEADERS, json=payload)
+
+    options = LLMSettings(
+        _env_file=None, api_key="test-key", classification_max_output_tokens=2048
+    )
+    examples = [
+        LabeledComment(comment="Банк отказал.", expected="bank_declined"),
+        LabeledComment(comment="Причину не сообщили.", expected="unclear"),
+        LabeledComment(comment="Слишком дорого.", expected="price"),
+    ]
+    with LLMClient(
+        options, http_client=httpx.Client(transport=httpx.MockTransport(respond))
+    ) as client:
+        report = evaluate_rejections(client, examples, batch_size=2)
+    assert [len(batch) for batch in sent] == [2, 1]
+    assert report.settings.model == "gpt-5-mini"
+    assert report.settings.max_output_tokens == 2048
+    assert report.correct == 1 and report.accuracy_pct == Decimal("33.33")
+    assert report.output_limit_batches == 1 and report.output_limit_rate_pct == Decimal(
+        "50.00"
+    )
+    assert [batch.status for batch in report.batches] == ["output_limit", "completed"]
+    assert report.batches[0].model == "gpt-5-mini-test"
+    assert report.batches[1].first_comment_id == 3
+    assert report.by_category[RejectionReason.BANK_DECLINED].unclassified == 1
+    assert report.by_category[RejectionReason.PRICE].correct == 1
+    assert [usage.total_tokens for usage in report.usage_by_request if usage] == [
+        1000,
+        1000,
+    ]
+
+
+def test_evaluation_cli_prints_json_and_returns_one_for_unclassified_batch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    path = tmp_path / "cases.json"
+    path.write_text(
+        json.dumps([{"comment": "Причину не указали.", "expected": "unclear"}]),
+        encoding="utf-8",
+    )
+    payload = _payload(status="incomplete", reason="max_output_tokens")
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    monkeypatch.setattr(
+        llm,
+        "DefaultHttpxClient",
+        lambda **_: httpx.Client(
+            transport=httpx.MockTransport(lambda _: httpx.Response(200, json=payload))
+        ),
+    )
+    assert ai_sales_main(["evaluate", str(path), "--batch-size", "4"]) == 1
+    result = json.loads(capsys.readouterr().out)
+    assert result["batch_size"] == 4
+    assert result["output_limit_batches"] == 1
+    assert result["by_category"]["unclear"]["unclassified"] == 1
 
 
 def _metrics(**values) -> SalesMetrics:
@@ -180,6 +322,66 @@ def _report(
 
 def _reference(metric: str, scope: str = "total") -> dict:
     return {"scope": scope, "metric": metric}
+
+
+def test_summary_without_values_is_insufficient() -> None:
+    report = _report(6, _metrics())
+    plan = {"metrics": [_reference("average_paid_check_rub")], "hypotheses": []}
+    with _client([plan]) as client:
+        result = summarize_sales(client, report)
+    assert result.output.status == "insufficient_data"
+    assert result.output.current_period == report.period
+    assert result.output.lines == ["Недостаточно данных для ответа."]
+    assert not result.output.observations and not result.output.hypotheses
+
+
+def test_summary_with_a_value_preserves_partial_results() -> None:
+    report = _report(6, _metrics(leads=0))
+    plan = {
+        "metrics": [_reference("average_paid_check_rub"), _reference("leads")],
+        "hypotheses": [],
+    }
+    with _client([plan]) as client:
+        result = summarize_sales(client, report)
+    assert result.output.status == "answered"
+    assert [item.current for item in result.output.observations] == [None, 0]
+    assert "нет данных" in result.output.lines[0]
+
+
+def test_summary_uses_comparison_when_current_is_missing() -> None:
+    report = SalesReportComparison(
+        current=_report(6, _metrics()),
+        comparison=_report(5, _metrics(average_paid_check_rub="750.00")),
+    )
+    plan = {"metrics": [_reference("average_paid_check_rub")], "hypotheses": []}
+    with _client([plan]) as client:
+        result = summarize_sales(client, report)
+    assert result.output.status == "answered"
+    (observation,) = result.output.observations
+    assert observation.current is None
+    assert observation.comparison == Decimal("750.00")
+    assert observation.difference is None
+
+
+@pytest.mark.parametrize(
+    "question",
+    [
+        "Как изменилась эффективность?",
+        "Какой менеджер лучший?",
+        "Как мы выступили относительно прошлого периода?",
+    ],
+)
+def test_ambiguous_questions_do_not_receive_unsupported_metrics(question: str) -> None:
+    plan = {"status": "insufficient_data", "metrics": [], "ranking": None}
+    sent = []
+    with _client([plan], sent) as client:
+        result = answer_sales_question(
+            client, _report(6, _metrics(leads=500)), question
+        )
+    assert sent[0]["question"] == question
+    assert result.output.status == "insufficient_data"
+    assert result.output.lines == ["Недостаточно данных для ответа."]
+    assert not result.output.observations
 
 
 def test_summary_values_and_hypothesis_evidence_come_from_report() -> None:
