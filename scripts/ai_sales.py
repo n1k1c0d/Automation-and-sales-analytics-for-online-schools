@@ -1,0 +1,103 @@
+import argparse
+import json
+import sys
+from collections.abc import Sequence
+from dataclasses import asdict
+from pathlib import Path
+
+from pydantic import BaseModel, TypeAdapter, ValidationError
+
+from app.ai.client import LLMClient, LLMError, LLMResult
+from app.ai.rejections import LabeledComment, classify_rejections, evaluate_rejections
+from app.ai.sales_analysis import Report, answer_sales_question, summarize_sales
+from app.core.config import LLMSettings
+
+LABELED_FIXTURE = Path("data/synthetic/ai/rejection_cases.json")
+
+
+def _arguments(argv: Sequence[str] | None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Analyze anonymized sales data with an LLM."
+    )
+    commands = parser.add_subparsers(dest="command", required=True)
+    classify = commands.add_parser(
+        "classify", help="Classify a JSON array of comments."
+    )
+    classify.add_argument("file", type=Path)
+    evaluate = commands.add_parser(
+        "evaluate", help="Score classification on labeled examples."
+    )
+    evaluate.add_argument("file", type=Path, nargs="?", default=LABELED_FIXTURE)
+    summarize = commands.add_parser(
+        "summarize", help="Summarize a sales_report JSON file."
+    )
+    summarize.add_argument("file", type=Path)
+    ask = commands.add_parser(
+        "ask", help="Ask a question about a sales_report JSON file."
+    )
+    ask.add_argument("file", type=Path)
+    ask.add_argument("question")
+    return parser.parse_args(argv)
+
+
+def _run(client: LLMClient, args: argparse.Namespace) -> LLMResult | BaseModel:
+    data = args.file.read_text(encoding="utf-8-sig")
+    if args.command == "classify":
+        comments = TypeAdapter(list[str]).validate_json(data)
+        return classify_rejections(client, comments)
+    if args.command == "evaluate":
+        examples = TypeAdapter(list[LabeledComment]).validate_json(data)
+        return evaluate_rejections(client, examples)
+
+    report = TypeAdapter(Report).validate_json(data)
+    if args.command == "summarize":
+        return summarize_sales(client, report)
+    return answer_sales_question(client, report, args.question)
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    args = _arguments(argv)
+    try:
+        settings = LLMSettings()
+    except ValidationError:
+        print(
+            "Check the OPENAI settings in .env, including OPENAI_API_KEY.",
+            file=sys.stderr,
+        )
+        return 2
+    try:
+        with LLMClient(settings) as client:
+            result = _run(client, args)
+    except (OSError, UnicodeError):
+        print("Could not read the input file as UTF-8.", file=sys.stderr)
+        return 2
+    except ValidationError:
+        print("Input JSON does not match the command's format.", file=sys.stderr)
+        return 2
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+    except LLMError as exc:
+        print(f"AI analysis failed ({exc.code}) — {exc}", file=sys.stderr)
+        if exc.request_id is not None:
+            print(f"Request ID {exc.request_id}", file=sys.stderr)
+        if exc.usage is not None:
+            print(json.dumps(asdict(exc.usage), default=str), file=sys.stderr)
+        return 2
+
+    if isinstance(result, LLMResult):
+        output = {
+            "output": result.output.model_dump(mode="json"),
+            "model": result.model,
+            "response_id": result.response_id,
+            "request_id": result.request_id,
+            "usage": asdict(result.usage) if result.usage is not None else None,
+        }
+    else:
+        output = result.model_dump(mode="json")
+    print(json.dumps(output, default=str, indent=2))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

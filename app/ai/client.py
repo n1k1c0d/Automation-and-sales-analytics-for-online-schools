@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import logging
 from dataclasses import dataclass
 from decimal import Decimal
@@ -56,6 +58,19 @@ class LLMResult[OutputT: BaseModel]:
     response_id: str
     request_id: str | None
     usage: LLMUsage | None
+
+    def with_output[ResultT: BaseModel](self, output: ResultT) -> LLMResult[ResultT]:
+        return LLMResult(
+            output, self.model, self.response_id, self.request_id, self.usage
+        )
+
+    def invalid_response(self, message: str) -> LLMError:
+        return LLMError(
+            LLMErrorCode.INVALID_RESPONSE,
+            message,
+            request_id=self.request_id,
+            usage=self.usage,
+        )
 
 
 class LLMError(Exception):
@@ -125,7 +140,7 @@ def _response_failure(response: Response) -> tuple[LLMErrorCode, str] | None:
 
 class LLMClient:
     def __init__(
-        self, settings: LLMSettings, *, http_client: "Client | None" = None
+        self, settings: LLMSettings, *, http_client: Client | None = None
     ) -> None:
         self._settings = settings
         timeout = settings.timeout_seconds
