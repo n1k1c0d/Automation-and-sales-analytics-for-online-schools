@@ -124,6 +124,20 @@ def test_normalized_obscured_email_is_blocked() -> None:
         check_comment_privacy(["Контакт learner\u200b@example.test."])
 
 
+def test_single_string_cannot_bypass_batch_privacy_check() -> None:
+    sent = []
+    with _client([], sent) as client, pytest.raises(ValueError, match="sequence"):
+        classify_rejections(client, "a@b.co")
+    assert not sent
+
+
+def test_oversized_batch_is_rejected_before_sending_any_comments() -> None:
+    sent = []
+    with _client([], sent) as client, pytest.raises(ValueError, match="between"):
+        classify_rejections(client, ["Курс слишком дорогой."] * (MAX_COMMENTS + 1))
+    assert not sent
+
+
 def test_evaluation_blocks_whole_file_before_first_batch() -> None:
     safe = LabeledComment(comment="Курс слишком дорогой.", expected="price")
     sensitive = LabeledComment(
@@ -162,18 +176,22 @@ def test_privacy_filter_allows_synthetic_business_data() -> None:
     [
         (),
         (_classification(2, "price", "дорого"),),
+        (_classification(1, "price", "дорого"), _classification(2, "unclear", None)),
         (_classification(1, "price", "дорого"), _classification(1, "price", "дорого")),
         (_classification(1, "price", "70 тысяч"),),
         (_classification(1, "unclear", "дорого"),),
         (_classification(1, "price", None),),
+        (_classification(1, "refund", "дорого"),),
     ],
     ids=[
         "missing-id",
         "unknown-id",
+        "extra-id",
         "duplicate-id",
         "invented-evidence",
         "unclear-with-quote",
         "missing-evidence",
+        "unknown-category",
     ],
 )
 def test_rejects_unverifiable_classifications(items: tuple[dict, ...]) -> None:
@@ -184,6 +202,17 @@ def test_rejects_unverifiable_classifications(items: tuple[dict, ...]) -> None:
         classify_rejections(client, ["Для нас слишком дорого."])
     assert caught.value.code == LLMErrorCode.INVALID_RESPONSE
     assert caught.value.usage is not None
+
+
+def test_evidence_must_belong_to_the_same_comment() -> None:
+    comments = ["Банк отказал в рассрочке.", "Условия рассрочки не подходят."]
+    plan = _classification_reply(
+        _classification(1, "financing_terms", comments[1]),
+        _classification(2, "bank_declined", comments[0]),
+    )
+    with _client([plan]) as client, pytest.raises(LLMError) as caught:
+        classify_rejections(client, comments)
+    assert caught.value.code == LLMErrorCode.INVALID_RESPONSE
 
 
 def test_evaluation_scores_labeled_examples_without_sending_the_labels() -> None:

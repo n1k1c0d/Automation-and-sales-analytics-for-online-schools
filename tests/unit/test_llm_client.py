@@ -10,7 +10,7 @@ from pydantic import BaseModel, ValidationError
 
 from app.ai import client as llm
 from app.ai.client import LLMClient, LLMError, LLMErrorCode, LLMOperation, LLMUsage
-from app.ai.rejections import ClassificationPlan
+from app.ai.rejections import MAX_COMMENTS, MAX_EVIDENCE_CHARS, ClassificationPlan
 from app.ai.sales_analysis import QuestionPlan, SummaryPlan
 from app.core.config import LLMSettings, PostgresSettings
 from scripts.ai_sales import main as ai_sales
@@ -238,8 +238,18 @@ def test_production_structured_output_contract(
         definition = descriptor["schema"]
         _assert_closed_objects(definition)
         if schema is ClassificationPlan:
+            batch = definition["properties"]["classifications"]
+            assert (batch["minItems"], batch["maxItems"]) == (1, MAX_COMMENTS)
             item = definition["$defs"]["RejectionClassification"]
-            assert {"type": "null"} in item["properties"]["evidence"]["anyOf"]
+            identifier = item["properties"]["comment_id"]
+            assert (identifier["minimum"], identifier["maximum"]) == (1, MAX_COMMENTS)
+            evidence = item["properties"]["evidence"]["anyOf"]
+            assert {"type": "null"} in evidence
+            assert {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": MAX_EVIDENCE_CHARS,
+            } in evidence
         if schema is QuestionPlan:
             assert {"type": "null"} in definition["properties"]["ranking"]["anyOf"]
         return httpx.Response(200, json=_payload(json.dumps(example)))
