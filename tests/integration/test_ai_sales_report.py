@@ -17,7 +17,7 @@ from tests.integration.test_standard_sales_kpis import EXPECTED_STANDARD_KPIS
 from tests.unit.test_llm_client import _payload
 
 
-def test_ai_cli_summarizes_sql_report_without_changing_kpis(
+def test_ai_cli_summarizes_and_ranks_sql_report_without_changing_kpis(
     isolated_postgres_engine: Engine,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -39,8 +39,21 @@ def test_ai_cli_summarizes_sql_report_without_changing_kpis(
 
     def respond(request: httpx.Request) -> httpx.Response:
         body = json.loads(request.content)
-        assert body["max_completion_tokens"] == 3072
         facts = json.loads(body["messages"][1]["content"])
+        if body["response_format"]["json_schema"]["name"] == "QuestionPlan":
+            assert "current" not in facts["scopes"]["total"]
+            plan = {
+                "status": "answered",
+                "metrics": [],
+                "ranking": {
+                    "dimension": "source",
+                    "metric": "paid_amount_rub",
+                    "period": "current",
+                    "order": "highest",
+                },
+            }
+            return httpx.Response(200, json=_payload(json.dumps(plan)))
+        assert body["max_completion_tokens"] == 3072
         assert facts["scopes"]["total"]["current"] == EXPECTED_STANDARD_KPIS
         assert "daily" not in facts
         assert (
@@ -85,3 +98,18 @@ def test_ai_cli_summarizes_sql_report_without_changing_kpis(
         == "lesson_to_payment_pct"
     )
     assert parsed["usage"]["total_tokens"] == 1000
+
+    assert (
+        ai_sales.main(
+            ["ask", str(report_file), "Какой источник принёс больше всего денег?"]
+        )
+        == 0
+    )
+    answer = json.loads(capsys.readouterr().out)["output"]
+    maximum = max(row.paid_amount_rub for row in report.by_source)
+    assert answer["status"] == "answered"
+    assert {(row["scope_label"], row["current"]) for row in answer["observations"]} == {
+        (row.source, str(maximum))
+        for row in report.by_source
+        if row.paid_amount_rub == maximum
+    }

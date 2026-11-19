@@ -4,6 +4,9 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 
 EMAIL = re.compile(r"[\w.+%'-]+@[\w-]+(?:\.[\w-]+)+")
+UUID_TEXT = re.compile(
+    r"\b[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}\b", re.IGNORECASE
+)
 PHONE = re.compile(
     r"(?<!\w)(?:\+(?:[ .()\-–—]*\d){9,15}|"
     r"(?:[78][ .\-–—]*)?(?:\(\d{3}\)|\d{3})[ .\-–—]*"
@@ -42,24 +45,35 @@ class CommentPrivacyError(ValueError):
         )
 
 
+def _privacy_categories(value: str, *, check_ids: bool = False) -> tuple[str, ...]:
+    normalized = unicodedata.normalize("NFKC", value)
+    text = "".join(char for char in normalized if unicodedata.category(char) != "Cf")
+    categories = []
+    if EMAIL.search(text):
+        categories.append("email")
+    if PHONE.search(text):
+        categories.append("phone")
+    if any(
+        pattern.search(text) for pattern in (NAME_LABEL, GIVEN_NAME, NAME_WITH_SURNAME)
+    ):
+        categories.append("name")
+    if check_ids and UUID_TEXT.search(text):
+        categories.append("identifier")
+    return tuple(categories)
+
+
+def check_analytics_text(value: str, *, field: str) -> None:
+    if categories := _privacy_categories(value, check_ids=True):
+        raise ValueError(
+            f"Potential personal data in {field} ({', '.join(categories)}). "
+            "Review and anonymize the input before sending."
+        )
+
+
 def check_comment_privacy(comments: Sequence[str]) -> None:
     findings = []
     for comment_id, comment in enumerate(comments, start=1):
-        normalized = unicodedata.normalize("NFKC", comment)
-        text = "".join(
-            char for char in normalized if unicodedata.category(char) != "Cf"
-        )
-        categories = []
-        if EMAIL.search(text):
-            categories.append("email")
-        if PHONE.search(text):
-            categories.append("phone")
-        if any(
-            pattern.search(text)
-            for pattern in (NAME_LABEL, GIVEN_NAME, NAME_WITH_SURNAME)
-        ):
-            categories.append("name")
-        if categories:
-            findings.append(CommentFinding(comment_id, tuple(categories)))
+        if categories := _privacy_categories(comment):
+            findings.append(CommentFinding(comment_id, categories))
     if findings:
         raise CommentPrivacyError(tuple(findings))

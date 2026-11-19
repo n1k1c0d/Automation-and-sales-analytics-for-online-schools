@@ -3,6 +3,7 @@ from collections.abc import Iterable
 from datetime import date
 from decimal import Decimal
 from pathlib import Path
+from uuid import UUID
 
 import httpx
 import pytest
@@ -21,6 +22,7 @@ from app.ai.rejections import (
 from app.ai.sales_analysis import answer_sales_question, summarize_sales
 from app.core.config import LLMSettings
 from app.schemas.sales_report import (
+    ManagerSalesMetrics,
     ReportPeriod,
     SalesMetrics,
     SalesReport,
@@ -352,9 +354,104 @@ def _reference(metric: str, scope: str = "total") -> dict:
     return {"scope": scope, "metric": metric}
 
 
-def test_summary_without_values_is_insufficient() -> None:
+@pytest.mark.parametrize("command", ["summary", "question"])
+@pytest.mark.parametrize("field", ["manager", "comparison_source", "source_filter"])
+def test_sensitive_report_text_is_blocked_before_http(command: str, field: str) -> None:
+    current, prior = _report(6, _metrics()), _report(5, _metrics())
+    if field == "manager":
+        sensitive = "ФИО: учебный пример"
+        current.by_manager.append(
+            ManagerSalesMetrics(
+                manager_id=UUID(int=1),
+                manager_name=sensitive,
+                **_metrics().model_dump(),
+            )
+        )
+    elif field == "comparison_source":
+        sensitive = "demo@example.test"
+        prior.by_source.append(
+            SourceSalesMetrics(source=sensitive, **_metrics().model_dump())
+        )
+    else:
+        sensitive = "demo@example.test"
+        current.source = prior.source = sensitive
+    report = SalesReportComparison(current=current, comparison=prior)
+    sent = []
+    with (
+        _client([], sent) as client,
+        pytest.raises(ValueError, match="Potential personal data") as caught,
+    ):
+        if command == "summary":
+            summarize_sales(client, report)
+        else:
+            answer_sales_question(client, report, "Сколько лидов?")
+    assert not sent and sensitive not in str(caught.value)
+
+
+@pytest.mark.parametrize(
+    "marker",
+    [
+        "demo＠example.test",
+        "+7 (900) 000-00-00",
+        "ffffffff-ffff-ffff-ffff-ffffffffffff",
+    ],
+)
+def test_sensitive_question_is_blocked_before_http(marker: str) -> None:
+    sent = []
+    with (
+        _client([], sent) as client,
+        pytest.raises(ValueError, match="sales question") as caught,
+    ):
+        answer_sales_question(
+            client, _report(6, _metrics()), f"Сколько оплат у {marker}?"
+        )
+    assert not sent and marker not in str(caught.value)
+
+
+def test_manager_name_and_uuid_stay_local_in_both_operations() -> None:
+    metrics = _metrics(leads=3)
+    report = _report(6, metrics)
+    manager_id = UUID("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
+    report.manager_id = manager_id
+    report.by_manager.append(
+        ManagerSalesMetrics(
+            manager_id=manager_id, manager_name="Demo Agent A", **metrics.model_dump()
+        )
+    )
+    ref = _reference("leads", "manager:1")
+    plans = [
+        {"metrics": [ref], "hypotheses": []},
+        {"status": "answered", "metrics": [ref], "ranking": None},
+    ]
+    sent = []
+    with _client(plans, sent) as client:
+        summary = summarize_sales(client, report)
+        answer = answer_sales_question(client, report, "Сколько лидов у Demo Agent A?")
+    for payload, result in zip(sent, (summary, answer), strict=True):
+        prompt = json.dumps(payload, ensure_ascii=False)
+        assert "Demo Agent A" not in prompt and str(manager_id) not in prompt
+        assert payload["filters"]["manager_filtered"] is True
+        (row,) = result.output.observations
+        assert (row.scope_label, row.current) == ("Demo Agent A", 3)
+        assert result.output.filters["manager_id"] == str(manager_id)
+    assert sent[1]["question"] == "Сколько лидов у manager:1?"
+    assert all(
+        set(scope) == {"dimension", "label"} for scope in sent[1]["scopes"].values()
+    )
+
+
+@pytest.mark.parametrize("with_hypothesis", [False, True])
+def test_summary_without_values_is_insufficient(with_hypothesis: bool) -> None:
     report = _report(6, _metrics())
-    plan = {"metrics": [_reference("average_paid_check_rub")], "hypotheses": []}
+    ref = _reference(
+        "lesson_to_payment_pct" if with_hypothesis else "average_paid_check_rub"
+    )
+    plan = {
+        "metrics": [ref],
+        "hypotheses": [{"kind": "payment_follow_up", "evidence": ref}]
+        if with_hypothesis
+        else [],
+    }
     with _client([plan]) as client:
         result = summarize_sales(client, report)
     assert result.output.status == "insufficient_data"
@@ -486,7 +583,7 @@ def test_ranked_answer_calculates_the_maximum_and_keeps_ties() -> None:
         result = answer_sales_question(
             client,
             _report(6, _metrics(), sources=sources),
-            "У какого канала больше всего оплат?",
+            "Какой источник принёс больше всего денег?",
         )
     assert [item.scope_label for item in result.output.observations] == [
         "webinar",
@@ -521,6 +618,11 @@ def test_question_selects_values_for_a_comparison() -> None:
     [
         {"status": "insufficient_data", "metrics": [], "ranking": None},
         {
+            "status": "insufficient_data",
+            "metrics": [_reference("average_paid_check_rub")],
+            "ranking": None,
+        },
+        {
             "status": "answered",
             "metrics": [_reference("average_paid_check_rub")],
             "ranking": None,
@@ -534,3 +636,60 @@ def test_question_reports_insufficient_data(plan: dict) -> None:
         )
     assert result.output.status == "insufficient_data"
     assert not result.output.observations
+
+
+@pytest.mark.parametrize(
+    ("period", "status", "winners"),
+    [("current", "answered", ["social"]), ("comparison", "insufficient_data", [])],
+)
+def test_ranking_treats_zero_and_missing_values_by_period(
+    period: str, status: str, winners: list[str]
+) -> None:
+    def source(label: str, value: str | None) -> SourceSalesMetrics:
+        return SourceSalesMetrics(
+            source=label, **_metrics(average_paid_check_rub=value).model_dump()
+        )
+
+    report = SalesReportComparison(
+        current=_report(
+            6, _metrics(), sources=[source("social", "0.00"), source("webinar", None)]
+        ),
+        comparison=_report(5, _metrics(), sources=[source("social", None)]),
+    )
+    ranking = {
+        "dimension": "source",
+        "metric": "average_paid_check_rub",
+        "period": period,
+        "order": "highest",
+    }
+    with _client([{"status": "answered", "metrics": [], "ranking": ranking}]) as client:
+        answer = answer_sales_question(
+            client, report, "Какой канал лидирует по среднему чеку?"
+        )
+    assert answer.output.status == status
+    assert [row.scope_label for row in answer.output.observations] == winners
+    if winners:
+        (row,) = answer.output.observations
+        assert (
+            row.current == Decimal("0.00")
+            and row.comparison is None
+            and row.difference is None
+        )
+
+
+@pytest.mark.parametrize("change", [{"metric": "imaginary_kpi"}, {"value": "99999.99"}])
+def test_ranking_rejects_invented_kpi_or_amount(change: dict) -> None:
+    ranking = {
+        "dimension": "source",
+        "metric": "paid_amount_rub",
+        "period": "current",
+        "order": "highest",
+    } | change
+    with (
+        _client([{"status": "answered", "metrics": [], "ranking": ranking}]) as client,
+        pytest.raises(LLMError) as caught,
+    ):
+        answer_sales_question(
+            client, _report(6, _metrics()), "Какой источник принёс больше всего денег?"
+        )
+    assert caught.value.code == LLMErrorCode.INVALID_RESPONSE

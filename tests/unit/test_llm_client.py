@@ -13,6 +13,7 @@ from app.ai.client import LLMClient, LLMError, LLMErrorCode, LLMOperation, LLMUs
 from app.ai.rejections import MAX_COMMENTS, MAX_EVIDENCE_CHARS, ClassificationPlan
 from app.ai.sales_analysis import QuestionPlan, SummaryPlan
 from app.core.config import LLMSettings, PostgresSettings
+from app.schemas.sales_report import SalesMetrics
 from scripts.ai_sales import main as ai_sales
 from scripts.check_llm import ConnectionCheck
 from scripts.check_llm import main as check_llm
@@ -252,6 +253,10 @@ def test_production_structured_output_contract(
             } in evidence
         if schema is QuestionPlan:
             assert {"type": "null"} in definition["properties"]["ranking"]["anyOf"]
+        if schema in (SummaryPlan, QuestionPlan):
+            assert set(definition["$defs"]["MetricCode"]["enum"]) == set(
+                SalesMetrics.model_fields
+            )
         return httpx.Response(200, json=_payload(json.dumps(example)))
 
     with LLMClient(_settings(), http_client=_http_client(respond)) as client:
