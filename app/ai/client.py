@@ -2,9 +2,14 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from decimal import Decimal
+from email.utils import parsedate_to_datetime
 from enum import StrEnum
 from http import HTTPStatus
+from math import isfinite
+from random import uniform
+from time import sleep
 from types import TracebackType
 from typing import TYPE_CHECKING, Literal, Self
 
@@ -27,6 +32,15 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 GROQ_BASE_URL = "https://api.groq.com/openai/v1"
 TOKENS_PER_MILLION = Decimal(1_000_000)
+MAX_ATTEMPTS = 3
+MAX_RETRY_DELAY_SECONDS = 30
+TRANSIENT_SERVER_ERRORS = (500, 502, 503, 504)
+QUOTA_CODES = (
+    "insufficient_quota",
+    "billing_hard_limit_reached",
+    "quota_exceeded",
+    "spend_limit_reached",
+)
 
 
 class LLMErrorCode(StrEnum):
@@ -59,7 +73,7 @@ class LLMRequestSettings:
 @dataclass(frozen=True, slots=True)
 class LLMUsage:
     input_tokens: int
-    cached_input_tokens: int
+    cached_input_tokens: int | None
     output_tokens: int
     total_tokens: int
     estimated_cost_usd: Decimal | None
@@ -72,10 +86,16 @@ class LLMResult[OutputT: BaseModel]:
     response_id: str
     request_id: str | None
     usage: LLMUsage | None
+    retry_usage: tuple[LLMUsage | None, ...] = ()
 
     def with_output[ResultT: BaseModel](self, output: ResultT) -> LLMResult[ResultT]:
         return LLMResult(
-            output, self.model, self.response_id, self.request_id, self.usage
+            output,
+            self.model,
+            self.response_id,
+            self.request_id,
+            self.usage,
+            self.retry_usage,
         )
 
     def invalid_response(self, message: str) -> LLMError:
@@ -85,6 +105,7 @@ class LLMResult[OutputT: BaseModel]:
             request_id=self.request_id,
             usage=self.usage,
             model=self.model,
+            retry_usage=self.retry_usage,
         )
 
 
@@ -97,15 +118,21 @@ class LLMError(Exception):
         request_id: str | None = None,
         usage: LLMUsage | None = None,
         model: str | None = None,
+        retry_usage: tuple[LLMUsage | None, ...] = (),
     ) -> None:
         super().__init__(message)
         self.code = code
         self.request_id = request_id
         self.usage = usage
         self.model = model
+        self.retry_usage = retry_usage
 
 
-def _status_error(error: APIStatusError) -> LLMError:
+def _status_error(
+    error: APIStatusError,
+    usage: LLMUsage | None,
+    retry_usage: tuple[LLMUsage | None, ...],
+) -> LLMError:
     if (
         error.status_code == HTTPStatus.BAD_REQUEST
         and error.code == "json_validate_failed"
@@ -121,14 +148,14 @@ def _status_error(error: APIStatusError) -> LLMError:
         )
     elif error.status_code == HTTPStatus.REQUEST_TIMEOUT:
         code, message = LLMErrorCode.TIMEOUT, "The provider request timed out."
+    elif (
+        error.status_code == HTTPStatus.PAYMENT_REQUIRED
+        or error.code in QUOTA_CODES
+        or error.type in QUOTA_CODES
+    ):
+        code, message = LLMErrorCode.QUOTA, "The provider quota is exhausted."
     elif error.status_code == HTTPStatus.TOO_MANY_REQUESTS:
-        if error.code in ("insufficient_quota", "billing_hard_limit_reached"):
-            code, message = LLMErrorCode.QUOTA, "The provider quota is exhausted."
-        else:
-            code, message = (
-                LLMErrorCode.RATE_LIMIT,
-                "The provider rate limit was reached.",
-            )
+        code, message = LLMErrorCode.RATE_LIMIT, "The provider rate limit was reached."
     elif error.status_code >= HTTPStatus.INTERNAL_SERVER_ERROR:
         code, message = (
             LLMErrorCode.UNAVAILABLE,
@@ -139,7 +166,27 @@ def _status_error(error: APIStatusError) -> LLMError:
             LLMErrorCode.REQUEST_REJECTED,
             "The provider rejected the request.",
         )
-    return LLMError(code, message, request_id=error.request_id)
+    return LLMError(
+        code, message, request_id=error.request_id, usage=usage, retry_usage=retry_usage
+    )
+
+
+def _retry_delay(retry_after: str | None, previous_retries: int) -> float | None:
+    minimum = 0.0
+    if retry_after:
+        try:
+            minimum = float(retry_after)
+        except ValueError:
+            try:
+                retry_at = parsedate_to_datetime(retry_after)
+                minimum = (retry_at - datetime.now(UTC)).total_seconds()
+            except (ValueError, TypeError, OverflowError):
+                pass
+    if minimum > MAX_RETRY_DELAY_SECONDS:
+        return None
+    backoff = 2**previous_retries
+    delay = max(backoff, minimum) if isfinite(minimum) else backoff
+    return min(MAX_RETRY_DELAY_SECONDS, delay + uniform(0, 0.5))
 
 
 class _GroqMetadata(BaseModel):
@@ -227,31 +274,61 @@ class LLMClient:
                 "The input exceeds the configured character limit.",
             )
 
-        try:
-            # Defer content parsing until finish_reason and usage have been read.
-            raw = self._client.chat.completions.with_raw_response.parse(
-                model=settings.model,
-                messages=[
-                    {"role": "system", "content": instructions},
-                    {"role": "user", "content": prompt},
-                ],
-                response_format=schema,
-                max_completion_tokens=settings.max_output_tokens,
-            )
-        except APITimeoutError:
-            raise LLMError(
-                LLMErrorCode.TIMEOUT, "The provider request timed out."
-            ) from None
-        except APIConnectionError:
-            raise LLMError(
-                LLMErrorCode.UNAVAILABLE, "Could not connect to the provider."
-            ) from None
-        except APIStatusError as error:
-            raise _status_error(error) from None
+        retry_usage: list[LLMUsage | None] = []
+        while True:
+            try:
+                raw = self._client.chat.completions.with_raw_response.parse(
+                    model=settings.model,
+                    messages=[
+                        {"role": "system", "content": instructions},
+                        {"role": "user", "content": prompt},
+                    ],
+                    response_format=schema,
+                    max_completion_tokens=settings.max_output_tokens,
+                )
+                break
+            except APITimeoutError:
+                raise LLMError(
+                    LLMErrorCode.TIMEOUT,
+                    "The provider request timed out.",
+                    retry_usage=tuple(retry_usage),
+                ) from None
+            except APIConnectionError:
+                raise LLMError(
+                    LLMErrorCode.UNAVAILABLE,
+                    "Could not connect to the provider.",
+                    retry_usage=tuple(retry_usage),
+                ) from None
+            except APIStatusError as error:
+                usage = self._error_usage(error)
+                failure = _status_error(error, usage, tuple(retry_usage))
+                temporary = failure.code is LLMErrorCode.RATE_LIMIT or (
+                    failure.code is LLMErrorCode.UNAVAILABLE
+                    and error.status_code in TRANSIENT_SERVER_ERRORS
+                )
+                if not temporary or len(retry_usage) + 1 >= MAX_ATTEMPTS:
+                    raise failure from None
+                delay = _retry_delay(
+                    error.response.headers.get("retry-after"), len(retry_usage)
+                )
+                if delay is None:
+                    raise failure from None
+                retry_usage.append(usage)
+                sleep(delay)
 
-        request_id = raw.headers.get("x-request-id")
+        return self._parse_completion(
+            raw.content, raw.headers.get("x-request-id"), schema, tuple(retry_usage)
+        )
+
+    def _parse_completion[OutputT: BaseModel](
+        self,
+        content: bytes,
+        request_id: str | None,
+        schema: type[OutputT],
+        retry_usage: tuple[LLMUsage | None, ...],
+    ) -> LLMResult[OutputT]:
         try:
-            response = _GroqCompletion.model_validate_json(raw.content, strict=True)
+            response = _GroqCompletion.model_validate_json(content, strict=True)
             if request_id is None and response.x_groq is not None:
                 request_id = response.x_groq.id
             usage = self._usage(response.usage)
@@ -260,6 +337,7 @@ class LLMClient:
                 LLMErrorCode.INVALID_RESPONSE,
                 "The provider returned invalid response metadata.",
                 request_id=request_id,
+                retry_usage=retry_usage,
             ) from None
         (choice,) = response.choices
         logger.info(
@@ -271,7 +349,11 @@ class LLMClient:
         )
         if failure := _response_failure(choice):
             raise LLMError(
-                *failure, request_id=request_id, usage=usage, model=response.model
+                *failure,
+                request_id=request_id,
+                usage=usage,
+                model=response.model,
+                retry_usage=retry_usage,
             )
         try:
             output = schema.model_validate_json(
@@ -284,20 +366,37 @@ class LLMClient:
                 request_id=request_id,
                 usage=usage,
                 model=response.model,
+                retry_usage=retry_usage,
             ) from None
-        return LLMResult(output, response.model, response.id, request_id, usage)
+        return LLMResult(
+            output, response.model, response.id, request_id, usage, retry_usage
+        )
+
+    def _error_usage(self, error: APIStatusError) -> LLMUsage | None:
+        try:
+            body = error.response.json()
+            if not isinstance(body, dict):
+                return None
+            usage = body.get("usage")
+            if usage is None and isinstance(error.body, dict):
+                usage = error.body.get("usage")
+            if usage is not None:
+                return self._usage(CompletionUsage.model_validate(usage, strict=True))
+        except ValueError:
+            # An unusable meter must not mask the original HTTP error.
+            pass
+        return None
 
     def _usage(self, data: CompletionUsage | None) -> LLMUsage | None:
         if data is None:
             return None
         details = data.prompt_tokens_details
-        cached = 0
-        if details is not None and details.cached_tokens is not None:
-            cached = details.cached_tokens
+        cached = details.cached_tokens if details is not None else None
+        discounted_tokens = cached or 0
         input_tokens = data.prompt_tokens
         output_tokens = data.completion_tokens
         if (
-            not 0 <= cached <= input_tokens
+            not 0 <= discounted_tokens <= input_tokens
             or output_tokens < 0
             or data.total_tokens != input_tokens + output_tokens
         ):
@@ -309,8 +408,9 @@ class LLMClient:
         cost = None
         if input_price is not None and output_price is not None:
             cost = (
-                (input_tokens - cached) * input_price
-                + cached * (input_price if cached_price is None else cached_price)
+                (input_tokens - discounted_tokens) * input_price
+                + discounted_tokens
+                * (input_price if cached_price is None else cached_price)
                 + output_tokens * output_price
             ) / TOKENS_PER_MILLION
         return LLMUsage(input_tokens, cached, output_tokens, data.total_tokens, cost)

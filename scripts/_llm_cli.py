@@ -1,8 +1,10 @@
+import json
+import sys
 from dataclasses import asdict
 
 from pydantic import ValidationError
 
-from app.ai.client import LLMResult
+from app.ai.client import LLMError, LLMResult, LLMUsage
 from app.core.config import LLMSettings
 
 
@@ -15,11 +17,28 @@ def settings_error_message(error: ValidationError) -> str:
     return f"Check Groq settings in .env: {', '.join(sorted(fields))}."
 
 
+def _retry_payload(attempts: tuple[LLMUsage | None, ...]) -> list[dict | None]:
+    return [asdict(usage) if usage is not None else None for usage in attempts]
+
+
+def print_error_usage(error: LLMError) -> None:
+    if error.retry_usage:
+        print(
+            json.dumps({"retry_usage": _retry_payload(error.retry_usage)}, default=str),
+            file=sys.stderr,
+        )
+    if error.usage is not None:
+        print(json.dumps(asdict(error.usage), default=str), file=sys.stderr)
+
+
 def result_payload(result: LLMResult) -> dict[str, object]:
-    return {
+    payload = {
         "output": result.output.model_dump(mode="json"),
         "model": result.model,
         "response_id": result.response_id,
         "request_id": result.request_id,
         "usage": asdict(result.usage) if result.usage is not None else None,
     }
+    if result.retry_usage:
+        payload["retry_usage"] = _retry_payload(result.retry_usage)
+    return payload

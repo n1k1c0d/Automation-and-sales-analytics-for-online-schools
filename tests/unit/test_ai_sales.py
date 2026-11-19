@@ -256,15 +256,37 @@ def test_evaluation_scores_labeled_examples_without_sending_the_labels() -> None
     assert evaluation.settings.max_output_tokens == 2048
 
 
-def test_evaluation_counts_output_limits_without_repeating_batches() -> None:
+def test_evaluation_tracks_attempts_without_counting_comments_twice(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     sent = []
+    waits = []
+    monkeypatch.setattr(llm, "sleep", waits.append)
 
     def respond(request: httpx.Request) -> httpx.Response:
         body = json.loads(request.content)
         assert body["max_completion_tokens"] == 2048
         sent.append(json.loads(body["messages"][1]["content"]))
         if len(sent) == 1:
+            return httpx.Response(
+                503,
+                json={
+                    "error": {"type": "server_error"},
+                    "usage": {
+                        "prompt_tokens": 20,
+                        "completion_tokens": 4,
+                        "total_tokens": 24,
+                    },
+                },
+            )
+        if len(sent) == 2:
             payload = _payload('{"classifications":', finish_reason="length")
+        elif len(sent) == 3:
+            return httpx.Response(
+                429,
+                headers={"Retry-After": "2"},
+                json={"error": {"code": "rate_limit_exceeded"}},
+            )
         else:
             plan = _classification_reply(_classification(1, "price", "дорого"))
             payload = _payload(json.dumps(plan))
@@ -282,7 +304,9 @@ def test_evaluation_counts_output_limits_without_repeating_batches() -> None:
         options, http_client=httpx.Client(transport=httpx.MockTransport(respond))
     ) as client:
         report = evaluate_rejections(client, examples, batch_size=2)
-    assert [len(batch) for batch in sent] == [2, 1]
+    assert [len(batch) for batch in sent] == [2, 2, 1, 1]
+    assert sent[0] == sent[1] and sent[2] == sent[3]
+    assert len(waits) == 2 and waits[1] >= 2
     assert report.settings.model == "qwen/qwen3.8-27b"
     assert report.settings.max_output_tokens == 2048
     assert report.correct == 1 and report.accuracy_pct == Decimal("33.33")
@@ -290,14 +314,14 @@ def test_evaluation_counts_output_limits_without_repeating_batches() -> None:
         "50.00"
     )
     assert [batch.status for batch in report.batches] == ["output_limit", "completed"]
+    assert [batch.attempts for batch in report.batches] == [2, 2]
     assert report.batches[0].model == "qwen-test"
     assert report.batches[1].first_comment_id == 3
     assert report.by_category[RejectionReason.BANK_DECLINED].unclassified == 1
     assert report.by_category[RejectionReason.PRICE].correct == 1
-    assert [usage.total_tokens for usage in report.usage_by_request if usage] == [
-        1000,
-        1000,
-    ]
+    assert [
+        usage.total_tokens if usage else None for usage in report.usage_by_request
+    ] == [24, 1000, None, 1000]
 
 
 @pytest.mark.parametrize(

@@ -1,7 +1,9 @@
 import json
 import logging
 from collections.abc import Callable
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+from email.utils import format_datetime
 from pathlib import Path
 
 import httpx
@@ -163,8 +165,11 @@ def test_estimated_cost_with_optional_rates(
     assert result.usage.estimated_cost_usd == estimated_cost
 
 
-def test_missing_provider_usage_is_reported_as_unknown() -> None:
-    payload = _payload() | {"usage": None}
+@pytest.mark.parametrize("usage_fields", [{}, {"usage": None}], ids=["absent", "null"])
+def test_missing_provider_usage_is_reported_as_unknown(usage_fields: dict) -> None:
+    payload = _payload()
+    del payload["usage"]
+    payload.update(usage_fields)
     http_client = _http_client(lambda _: httpx.Response(200, json=payload))
     with LLMClient(_settings(), http_client=http_client) as client:
         result = _generate(client)
@@ -173,13 +178,23 @@ def test_missing_provider_usage_is_reported_as_unknown() -> None:
     assert result.request_id == "req_body"
 
 
-def test_groq_usage_without_cache_details() -> None:
+@pytest.mark.parametrize("details", [None, {}, {"cached_tokens": 0}])
+def test_groq_usage_without_cache_discount(details: dict | None) -> None:
     payload = _payload()
-    del payload["usage"]["prompt_tokens_details"]
+    if details is None:
+        del payload["usage"]["prompt_tokens_details"]
+    else:
+        payload["usage"]["prompt_tokens_details"] = details
     http_client = _http_client(lambda _: httpx.Response(200, json=payload))
-    with LLMClient(_settings(), http_client=http_client) as client:
+    rates = _settings(
+        input_usd_per_million="2",
+        cached_input_usd_per_million="0.5",
+        output_usd_per_million="8",
+    )
+    with LLMClient(rates, http_client=http_client) as client:
         result = _generate(client)
-    assert result.usage == LLMUsage(900, 0, 100, 1000, None)
+    cached = (details or {}).get("cached_tokens")
+    assert result.usage == LLMUsage(900, cached, 100, 1000, Decimal("0.0026"))
 
 
 def _assert_closed_objects(node: object) -> None:
@@ -353,17 +368,21 @@ def test_unsuccessful_generation_preserves_usage(
     expected: LLMErrorCode,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    http_client = _http_client(
-        lambda _: httpx.Response(200, headers=REQUEST_HEADERS, json=payload)
-    )
+    requests = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, headers=REQUEST_HEADERS, json=payload)
+
     with (
         caplog.at_level(logging.INFO, logger=llm.__name__),
-        LLMClient(_settings(), http_client=http_client) as client,
+        LLMClient(_settings(), http_client=_http_client(respond)) as client,
         pytest.raises(LLMError) as caught,
     ):
         _generate(client, schema=schema)
     error = caught.value
     assert error.code == expected
+    assert len(requests) == 1 and error.retry_usage == ()
     assert error.model == "qwen-test"
     assert error.request_id == REQUEST_ID
     assert error.usage == LLMUsage(900, 400, 100, 1000, None)
@@ -371,22 +390,34 @@ def test_unsuccessful_generation_preserves_usage(
 
 
 @pytest.mark.parametrize(
-    ("status", "provider_code", "expected"),
+    ("status", "provider_code", "expected", "attempts"),
     [
-        (400, "invalid_request", LLMErrorCode.REQUEST_REJECTED),
-        (400, "json_validate_failed", LLMErrorCode.INVALID_RESPONSE),
-        (401, "invalid_api_key", LLMErrorCode.AUTHENTICATION),
-        (403, "permission_denied", LLMErrorCode.AUTHENTICATION),
-        (408, "timeout", LLMErrorCode.TIMEOUT),
-        (429, "rate_limit_exceeded", LLMErrorCode.RATE_LIMIT),
-        (429, "insufficient_quota", LLMErrorCode.QUOTA),
-        (503, "server_error", LLMErrorCode.UNAVAILABLE),
+        (400, "invalid_request", LLMErrorCode.REQUEST_REJECTED, 1),
+        (400, "json_validate_failed", LLMErrorCode.INVALID_RESPONSE, 1),
+        (401, "invalid_api_key", LLMErrorCode.AUTHENTICATION, 1),
+        (403, "permission_denied", LLMErrorCode.AUTHENTICATION, 1),
+        (408, "timeout", LLMErrorCode.TIMEOUT, 1),
+        (429, "rate_limit_exceeded", LLMErrorCode.RATE_LIMIT, 3),
+        (429, "insufficient_quota", LLMErrorCode.QUOTA, 1),
+        (429, "billing_hard_limit_reached", LLMErrorCode.QUOTA, 1),
+        (500, "server_error", LLMErrorCode.UNAVAILABLE, 3),
+        (502, "server_error", LLMErrorCode.UNAVAILABLE, 3),
+        (503, "server_error", LLMErrorCode.UNAVAILABLE, 3),
+        (504, "server_error", LLMErrorCode.UNAVAILABLE, 3),
+        (501, "not_implemented", LLMErrorCode.UNAVAILABLE, 1),
     ],
 )
-def test_provider_status_is_normalized_without_retry(
-    status: int, provider_code: str, expected: LLMErrorCode
+def test_provider_status_and_retry_bound(
+    status: int,
+    provider_code: str,
+    expected: LLMErrorCode,
+    attempts: int,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     calls = []
+    waits = []
+    monkeypatch.setattr(llm, "sleep", waits.append)
+    monkeypatch.setattr(llm, "uniform", lambda low, high: 0.25)
 
     def respond(request: httpx.Request) -> httpx.Response:
         calls.append(request)
@@ -404,7 +435,88 @@ def test_provider_status_is_normalized_without_retry(
     assert caught.value.code == expected
     assert caught.value.request_id == REQUEST_ID and caught.value.usage is None
     assert PROVIDER_MESSAGE not in str(caught.value)
-    assert len(calls) == 1
+    assert len(calls) == attempts
+    assert waits == [1.25, 2.25][: attempts - 1]
+    assert caught.value.retry_usage == (None,) * (attempts - 1)
+
+
+@pytest.mark.parametrize(
+    ("retry_after", "minimum"), [("4", 4), ("2.5", 2.5), ("bad", 1), ("-3", 1)]
+)
+def test_retry_after_and_jitter_before_success(
+    retry_after: str, minimum: float, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    requests = []
+    waits = []
+    monkeypatch.setattr(llm, "sleep", waits.append)
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if len(requests) == 1:
+            return httpx.Response(
+                429,
+                headers={"Retry-After": retry_after},
+                json={"error": {"type": "rate_limit_exceeded"}},
+            )
+        return httpx.Response(200, headers=REQUEST_HEADERS, json=_payload())
+
+    with LLMClient(_settings(), http_client=_http_client(respond)) as client:
+        result = _generate(client)
+    first, second = requests
+    assert first.url == second.url and first.content == second.content
+    assert len(waits) == 1 and minimum <= waits[0] <= minimum + 0.5
+    assert result.output.status == "ok" and result.retry_usage == (None,)
+    assert result.usage == LLMUsage(900, 400, 100, 1000, None)
+
+
+@pytest.mark.parametrize("retry_after", ["86400", "http-date"])
+def test_long_retry_after_returns_control_without_retry(retry_after: str) -> None:
+    if retry_after == "http-date":
+        retry_after = format_datetime(
+            datetime.now(UTC) + timedelta(days=1), usegmt=True
+        )
+    calls = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        return httpx.Response(429, headers={"retry-after": retry_after})
+
+    with (
+        LLMClient(_settings(), http_client=_http_client(respond)) as client,
+        pytest.raises(LLMError) as caught,
+    ):
+        _generate(client)
+    assert caught.value.code == LLMErrorCode.RATE_LIMIT
+    assert len(calls) == 1 and caught.value.retry_usage == ()
+
+
+def test_quota_in_error_type_stops_after_a_temporary_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    replies = iter(
+        [
+            httpx.Response(503, json={"error": {"usage": _payload()["usage"]}}),
+            httpx.Response(
+                429,
+                json={"error": {"type": "insufficient_quota"}},
+                headers=REQUEST_HEADERS,
+            ),
+        ]
+    )
+    waits = []
+    monkeypatch.setattr(llm, "sleep", waits.append)
+    with (
+        LLMClient(
+            _settings(), http_client=_http_client(lambda _: next(replies))
+        ) as client,
+        pytest.raises(LLMError) as caught,
+    ):
+        _generate(client)
+    assert len(waits) == 1
+    assert caught.value.code == LLMErrorCode.QUOTA
+    assert caught.value.request_id == REQUEST_ID
+    assert caught.value.usage is None
+    assert caught.value.retry_usage == (LLMUsage(900, 400, 100, 1000, None),)
 
 
 @pytest.mark.parametrize(
@@ -456,8 +568,17 @@ def test_rejects_oversized_input_before_request() -> None:
             _payload()
             | {"usage": {"prompt_tokens": 3, "completion_tokens": 4, "total_tokens": 6}}
         ),
+        json.dumps(
+            _payload()
+            | {"usage": {"input_tokens": 3, "output_tokens": 4, "total_tokens": 7}}
+        ),
     ],
-    ids=["malformed-json", "missing-choice", "inconsistent-tokens"],
+    ids=[
+        "malformed-json",
+        "missing-choice",
+        "inconsistent-tokens",
+        "responses-api-usage",
+    ],
 )
 def test_malformed_provider_envelope_is_an_error(body: str) -> None:
     http_client = _http_client(

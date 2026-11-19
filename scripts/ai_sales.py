@@ -2,7 +2,6 @@ import argparse
 import json
 import sys
 from collections.abc import Sequence
-from dataclasses import asdict
 from pathlib import Path
 
 from pydantic import BaseModel, TypeAdapter, ValidationError
@@ -17,7 +16,7 @@ from app.ai.rejections import (
 )
 from app.ai.sales_analysis import Report, answer_sales_question, summarize_sales
 from app.core.config import LLMSettings
-from scripts._llm_cli import result_payload, settings_error_message
+from scripts._llm_cli import print_error_usage, result_payload, settings_error_message
 
 LABELED_FIXTURE = Path("data/synthetic/ai/rejection_cases.json")
 OUTPUT_LIMIT_HINTS = {
@@ -99,8 +98,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(OUTPUT_LIMIT_HINTS[args.command], file=sys.stderr)
         if exc.request_id is not None:
             print(f"Request ID {exc.request_id}", file=sys.stderr)
-        if exc.usage is not None:
-            print(json.dumps(asdict(exc.usage), default=str), file=sys.stderr)
+        print_error_usage(exc)
         return 2
 
     if isinstance(result, LLMResult):

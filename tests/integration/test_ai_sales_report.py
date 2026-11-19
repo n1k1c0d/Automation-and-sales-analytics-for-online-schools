@@ -36,8 +36,12 @@ def test_ai_cli_summarizes_and_ranks_sql_report_without_changing_kpis(
     report = read_sales_report(isolated_postgres_engine, period)
     report_file = tmp_path / "report.json"
     report_file.write_text(report.model_dump_json(), encoding="utf-8-sig")
+    summary_requests = []
+    waits = []
+    monkeypatch.setattr(llm, "sleep", waits.append)
 
     def respond(request: httpx.Request) -> httpx.Response:
+        assert str(request.url) == "https://api.groq.com/openai/v1/chat/completions"
         body = json.loads(request.content)
         facts = json.loads(body["messages"][1]["content"])
         if body["response_format"]["json_schema"]["name"] == "QuestionPlan":
@@ -54,6 +58,9 @@ def test_ai_cli_summarizes_and_ranks_sql_report_without_changing_kpis(
             }
             return httpx.Response(200, json=_payload(json.dumps(plan)))
         assert body["max_completion_tokens"] == 3072
+        summary_requests.append(request.content)
+        if len(summary_requests) == 1:
+            return httpx.Response(503, json={"error": {"type": "server_error"}})
         assert facts["scopes"]["total"]["current"] == EXPECTED_STANDARD_KPIS
         assert "daily" not in facts
         assert (
@@ -79,6 +86,7 @@ def test_ai_cli_summarizes_and_ranks_sql_report_without_changing_kpis(
     for field in LLMSettings.model_fields:
         monkeypatch.delenv(f"GROQ_{field.upper()}", raising=False)
     monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     monkeypatch.setenv("GROQ_API_KEY", "test-key")
     monkeypatch.setenv("GROQ_SUMMARY_MAX_OUTPUT_TOKENS", "3072")
     monkeypatch.setattr(
@@ -88,6 +96,9 @@ def test_ai_cli_summarizes_and_ranks_sql_report_without_changing_kpis(
     )
     assert ai_sales.main(["summarize", str(report_file)]) == 0
     parsed = json.loads(capsys.readouterr().out)
+    assert len(waits) == 1 and len(summary_requests) == 2
+    assert summary_requests[0] == summary_requests[1]
+    assert parsed["retry_usage"] == [None]
     assert [row["current"] for row in parsed["output"]["observations"]] == [
         500,
         "8506500.00",

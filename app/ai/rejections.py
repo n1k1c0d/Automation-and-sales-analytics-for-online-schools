@@ -102,6 +102,7 @@ class EvaluationBatch(BaseModel):
     status: Literal["completed", "output_limit"]
     model: str | None
     request_id: str | None
+    attempts: int = 1
 
 
 class ClassificationEvaluation(BaseModel):
@@ -218,9 +219,10 @@ def evaluate_rejections(
                     status="output_limit",
                     model=exc.model,
                     request_id=exc.request_id,
+                    attempts=1 + len(exc.retry_usage),
                 )
             )
-            usage.append(exc.usage)
+            usage.extend((*exc.retry_usage, exc.usage))
             continue
 
         batches.append(
@@ -230,9 +232,10 @@ def evaluate_rejections(
                 status="completed",
                 model=result.model,
                 request_id=result.request_id,
+                attempts=1 + len(result.retry_usage),
             )
         )
-        usage.append(result.usage)
+        usage.extend((*result.retry_usage, result.usage))
         for (number, example), actual in zip(
             batch, result.output.classifications, strict=True
         ):
