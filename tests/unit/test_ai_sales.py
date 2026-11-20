@@ -184,7 +184,6 @@ def test_privacy_filter_allows_synthetic_business_data() -> None:
         (_classification(1, "price", "дорого"), _classification(2, "unclear", None)),
         (_classification(1, "price", "дорого"), _classification(1, "price", "дорого")),
         (_classification(1, "price", "70 тысяч"),),
-        (_classification(1, "unclear", "дорого"),),
         (_classification(1, "price", None),),
         (_classification(1, "refund", "дорого"),),
     ],
@@ -194,7 +193,6 @@ def test_privacy_filter_allows_synthetic_business_data() -> None:
         "extra-id",
         "duplicate-id",
         "invented-evidence",
-        "unclear-with-quote",
         "missing-evidence",
         "unknown-category",
     ],
@@ -207,6 +205,19 @@ def test_rejects_unverifiable_classifications(items: tuple[dict, ...]) -> None:
         classify_rejections(client, ["Для нас слишком дорого."])
     assert caught.value.code == LLMErrorCode.INVALID_RESPONSE
     assert caught.value.usage is not None
+
+
+def test_unclear_evidence_is_normalized_to_null() -> None:
+    comment = "Назвали цену и неудобное расписание двумя равными причинами отказа."
+    plan = _classification_reply(_classification(1, "unclear", comment))
+    sent = []
+    with _client([plan], sent) as client:
+        result = classify_rejections(client, [comment])
+    (item,) = result.output.classifications
+    assert item.comment_id == 1 and item.reason is RejectionReason.UNCLEAR
+    assert item.evidence is None
+    assert result.output.counts[RejectionReason.UNCLEAR] == 1
+    assert len(sent) == 1 and result.retry_usage == ()
 
 
 def test_evidence_must_belong_to_the_same_comment() -> None:
@@ -263,7 +274,7 @@ def test_id_error_identifies_missing_duplicate_or_foreign_ids(ids: list[int]) ->
     [
         ("price", "Курс слишком дорогой.", False),
         ("price", None, False),
-        ("unclear", "выше бюджета", True),
+        ("bank_declined", "Банк отказал.", False),
     ],
 )
 def test_evidence_error_reports_only_safe_metadata(
@@ -304,7 +315,7 @@ def test_overlong_verbatim_evidence_fails_local_schema_once() -> None:
 def test_evaluation_error_locates_the_batch_and_preserves_the_cause() -> None:
     example = LabeledComment(comment="Причину не сообщили.", expected="unclear")
     ok = _classification_reply(_classification(1, "unclear", None))
-    invalid = _classification_reply(_classification(1, "unclear", example.comment))
+    invalid = _classification_reply(_classification(1, "price", "Слишком дорого."))
     sent = []
     with _client([ok, invalid], sent) as client, pytest.raises(LLMError) as caught:
         evaluate_rejections(client, [example] * 3, batch_size=1)
@@ -327,7 +338,7 @@ def test_evaluation_scores_labeled_examples_without_sending_the_labels() -> None
     predictions = [
         _classification_reply(
             _classification(1, "price", "общая стоимость выше нашего бюджета"),
-            _classification(2, "financing_terms", "цена программы слишком высокая"),
+            _classification(2, "unclear", "цена программы слишком высокая"),
             _classification(3, "bank_declined", "отказал в рассрочке"),
             _classification(4, "bank_declined", "заявку не одобрили"),
             _classification(5, "financing_terms", "не устраивают проценты"),
@@ -347,7 +358,7 @@ def test_evaluation_scores_labeled_examples_without_sending_the_labels() -> None
     )
     assert [
         (item.comment_id, item.expected, item.actual) for item in evaluation.mismatches
-    ] == [(2, RejectionReason.PRICE, RejectionReason.FINANCING_TERMS)]
+    ] == [(2, RejectionReason.PRICE, RejectionReason.UNCLEAR)]
     assert [len(batch) for batch in sent] == [8, 1]
     assert all(set(row) == {"comment_id", "comment"} for batch in sent for row in batch)
     assert len(evaluation.usage_by_request) == 2

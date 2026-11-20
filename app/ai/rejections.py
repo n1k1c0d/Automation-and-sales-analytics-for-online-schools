@@ -167,15 +167,14 @@ def classify_rejections(
         evidence = item.evidence
         exact_substring = bool(evidence and evidence in comment)
         if item.reason is RejectionReason.UNCLEAR:
-            valid = evidence is None
-        else:
-            valid = bool(
-                evidence
-                and evidence.strip()
-                and len(evidence) <= MAX_EVIDENCE_CHARS
-                and exact_substring
-            )
-        if not valid:
+            if evidence is not None:
+                item = item.model_copy(update={"evidence": None})
+        elif not (
+            evidence
+            and evidence.strip()
+            and len(evidence) <= MAX_EVIDENCE_CHARS
+            and exact_substring
+        ):
             raise result.invalid_response(
                 f"Invalid evidence for comment_id={comment_id}, reason={item.reason.value}, "
                 f"is_null={evidence is None}, length={len(evidence) if evidence else 0}, "
