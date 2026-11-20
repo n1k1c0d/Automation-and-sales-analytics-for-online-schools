@@ -74,6 +74,174 @@ def _classification_reply(*items: dict) -> dict:
     return {"classifications": items}
 
 
+def _mock_json_fallback(
+    monkeypatch: pytest.MonkeyPatch, final_response: httpx.Response
+) -> list[dict]:
+    requests = []
+    schema_error = {"error": {"code": "json_validate_failed"}}
+    replies = iter(
+        [
+            httpx.Response(
+                400,
+                json=schema_error
+                | {
+                    "usage": {
+                        "prompt_tokens": 20,
+                        "completion_tokens": 4,
+                        "total_tokens": 24,
+                    }
+                },
+            ),
+            httpx.Response(400, json=schema_error),
+            final_response,
+        ]
+    )
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        requests.append(json.loads(request.content))
+        return next(replies)
+
+    monkeypatch.setattr(llm, "sleep", lambda _: None)
+    monkeypatch.setattr(
+        llm,
+        "DefaultHttpxClient",
+        lambda **_: httpx.Client(transport=httpx.MockTransport(respond)),
+    )
+    return requests
+
+
+@pytest.mark.parametrize("command", ["classify", "evaluate"])
+def test_cli_accepts_valid_json_fallback_and_reports_all_attempts(
+    command: str,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("GROQ_API_KEY", "test-key")
+    comment = "Банк отказал в рассрочке."
+    item = _classification(1, "bank_declined", comment)
+    path = tmp_path / "input.json"
+    rows = (
+        [comment]
+        if command == "classify"
+        else [{"comment": comment, "expected": "bank_declined"}]
+    )
+    path.write_text(json.dumps(rows), encoding="utf-8")
+    requests = _mock_json_fallback(
+        monkeypatch,
+        httpx.Response(200, json=_payload(json.dumps(_classification_reply(item)))),
+    )
+
+    assert ai_sales_main([command, str(path)]) == 0
+    strict, repeat, fallback = requests
+    assert strict == repeat
+    assert strict["response_format"]["json_schema"]["strict"] is True
+    assert fallback["response_format"] == {"type": "json_object"}
+    assert fallback["model"] == strict["model"]
+    assert fallback["max_completion_tokens"] == strict["max_completion_tokens"]
+    assert fallback["messages"][1] == strict["messages"][1]
+    instructions = fallback["messages"][0]["content"]
+    assert instructions.startswith(strict["messages"][0]["content"])
+    for field in ("classifications", "comment_id", "reason", "evidence"):
+        assert f'"{field}"' in instructions
+
+    report = json.loads(capsys.readouterr().out)
+    if command == "evaluate":
+        assert report["correct"] == report["total"] == 1
+        (batch,) = report["batches"]
+        usage = report["usage_by_request"]
+    else:
+        assert report["output"]["classifications"] == [item]
+        batch = report
+        usage = [*report["retry_usage"], report["usage"]]
+    assert batch["response_mode"] == "json_object" and batch["attempts"] == 3
+    assert [u["total_tokens"] if u else None for u in usage] == [24, None, 1000]
+
+
+@pytest.mark.parametrize(
+    ("content", "diagnostic"),
+    [
+        ("{", "local Pydantic validation"),
+        (
+            json.dumps(_classification_reply(_classification(1, "invented", None))),
+            "local Pydantic validation",
+        ),
+        (
+            json.dumps(_classification_reply(_classification(9, "unclear", None))),
+            "local business schema validation",
+        ),
+        (
+            json.dumps(
+                _classification_reply(*[_classification(1, "unclear", None)] * 2)
+            ),
+            "IDs mismatch",
+        ),
+    ],
+)
+def test_evaluation_rejects_invalid_fallback_once(
+    content: str, diagnostic: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    requests = _mock_json_fallback(
+        monkeypatch,
+        httpx.Response(200, headers=REQUEST_HEADERS, json=_payload(content)),
+    )
+    example = LabeledComment(comment="Причины нет.", expected="unclear")
+    with (
+        LLMClient(LLMSettings(_env_file=None, api_key="test-key")) as client,
+        pytest.raises(LLMError) as caught,
+    ):
+        evaluate_rejections(client, [example])
+    error = caught.value
+    assert error.code == LLMErrorCode.INVALID_RESPONSE
+    assert "rows 1-1" in str(error) and diagnostic in str(error)
+    assert error.response_mode == "json_object" and error.attempts == len(requests) == 3
+    assert requests[-1]["response_format"] == {"type": "json_object"}
+    assert error.request_id == REQUEST_HEADERS["x-request-id"]
+    assert [
+        u.total_tokens if u else None for u in (*error.retry_usage, error.usage)
+    ] == [24, None, 1000]
+
+
+def test_evaluation_rejects_invented_evidence_in_fallback_for_long_comment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    comment = "Стоимость выше бюджета.".ljust(MAX_EVIDENCE_CHARS + 1, "!")
+    reply = _classification_reply(_classification(1, "price", "Слишком дорого."))
+    requests = _mock_json_fallback(
+        monkeypatch, httpx.Response(200, json=_payload(json.dumps(reply)))
+    )
+    with (
+        LLMClient(LLMSettings(_env_file=None, api_key="test-key")) as client,
+        pytest.raises(LLMError, match="Invalid evidence for comment_id=1") as caught,
+    ):
+        evaluate_rejections(client, [LabeledComment(comment=comment, expected="price")])
+    assert caught.value.code == LLMErrorCode.INVALID_RESPONSE
+    assert "exact_substring=False" in str(caught.value)
+    assert caught.value.response_mode == "json_object"
+    assert caught.value.attempts == len(requests) == 3
+
+
+def test_evaluation_reports_truncated_fallback_with_unknown_final_usage(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    truncated = _payload('{"classifications":', finish_reason="length") | {
+        "usage": None
+    }
+    requests = _mock_json_fallback(monkeypatch, httpx.Response(200, json=truncated))
+    example = LabeledComment(comment="Причины нет.", expected="unclear")
+    with LLMClient(LLMSettings(_env_file=None, api_key="test-key")) as client:
+        report = evaluate_rejections(client, [example])
+    (batch,) = report.batches
+    assert batch.status == "output_limit" and report.correct == 0
+    assert batch.attempts == len(requests) == 3 and batch.response_mode == "json_object"
+    assert [u.total_tokens if u else None for u in report.usage_by_request] == [
+        24,
+        None,
+        None,
+    ]
+
+
 def test_classification_preserves_input_order_and_calculates_counts() -> None:
     plans = [
         _classification_reply(
@@ -183,8 +351,6 @@ def test_privacy_filter_allows_synthetic_business_data() -> None:
         (_classification(2, "price", "дорого"),),
         (_classification(1, "price", "дорого"), _classification(2, "unclear", None)),
         (_classification(1, "price", "дорого"), _classification(1, "price", "дорого")),
-        (_classification(1, "price", "70 тысяч"),),
-        (_classification(1, "price", None),),
         (_classification(1, "refund", "дорого"),),
     ],
     ids=[
@@ -192,8 +358,6 @@ def test_privacy_filter_allows_synthetic_business_data() -> None:
         "unknown-id",
         "extra-id",
         "duplicate-id",
-        "invented-evidence",
-        "missing-evidence",
         "unknown-category",
     ],
 )
@@ -221,14 +385,17 @@ def test_unclear_evidence_is_normalized_to_null() -> None:
 
 
 def test_evidence_must_belong_to_the_same_comment() -> None:
-    comments = ["Банк отказал в рассрочке.", "Условия рассрочки не подходят."]
+    quotes = ["Банк отказал в рассрочке.", "Условия рассрочки не подходят."]
+    comments = [" ".join([quote] * 8) for quote in quotes]
     plan = _classification_reply(
-        _classification(1, "financing_terms", comments[1]),
-        _classification(2, "bank_declined", comments[0]),
+        _classification(1, "financing_terms", quotes[1]),
+        _classification(2, "bank_declined", quotes[0]),
     )
     with _client([plan]) as client, pytest.raises(LLMError) as caught:
         classify_rejections(client, comments)
     assert caught.value.code == LLMErrorCode.INVALID_RESPONSE
+    assert "Invalid evidence for comment_id=1" in str(caught.value)
+    assert "exact_substring=False" in str(caught.value)
 
 
 def test_four_comments_accept_verbatim_evidence_and_unclear_null() -> None:
@@ -280,7 +447,7 @@ def test_id_error_identifies_missing_duplicate_or_foreign_ids(ids: list[int]) ->
 def test_evidence_error_reports_only_safe_metadata(
     reason: str, evidence: str | None, exact: bool, caplog: pytest.LogCaptureFixture
 ) -> None:
-    comment = "Стоимость выше бюджета."
+    comment = " ".join(["Стоимость выше бюджета."] * 7)
     plan = _classification_reply(_classification(1, reason, evidence))
     sent = []
     with (
@@ -308,21 +475,50 @@ def test_overlong_verbatim_evidence_fails_local_schema_once() -> None:
     with _client([plan], sent) as client, pytest.raises(LLMError) as caught:
         classify_rejections(client, [evidence])
     assert caught.value.code == LLMErrorCode.INVALID_RESPONSE
-    assert "failed local Pydantic validation" in str(caught.value)
+    assert (
+        str(caught.value) == "Classification failed local business schema validation."
+    )
     assert len(sent) == 1 and evidence not in str(caught.value)
+
+
+@pytest.mark.parametrize(
+    "items",
+    [
+        [_classification(0, "unclear", None)],
+        [_classification(9, "unclear", None)],
+        [_classification(1, "unclear", None)] * 9,
+        [],
+        [_classification(1, "price", "")],
+    ],
+    ids=["id-zero", "id-nine", "nine-items", "empty-batch", "empty-evidence"],
+)
+def test_local_business_schema_rejects_out_of_bounds_groq_result(
+    items: list[dict],
+) -> None:
+    sent = []
+    with (
+        _client([_classification_reply(*items)], sent) as client,
+        pytest.raises(LLMError) as caught,
+    ):
+        classify_rejections(client, ["Причину не сообщили."])
+    error = caught.value
+    assert error.code == LLMErrorCode.INVALID_RESPONSE
+    assert str(error) == "Classification failed local business schema validation."
+    assert error.request_id == REQUEST_HEADERS["x-request-id"]
+    assert len(sent) == 1 and error.usage is not None and error.retry_usage == ()
 
 
 def test_evaluation_error_locates_the_batch_and_preserves_the_cause() -> None:
     example = LabeledComment(comment="Причину не сообщили.", expected="unclear")
     ok = _classification_reply(_classification(1, "unclear", None))
-    invalid = _classification_reply(_classification(1, "price", "Слишком дорого."))
+    invalid = _classification_reply(_classification(2, "unclear", None))
     sent = []
     with _client([ok, invalid], sent) as client, pytest.raises(LLMError) as caught:
         evaluate_rejections(client, [example] * 3, batch_size=1)
     error = caught.value
     assert error.code == LLMErrorCode.INVALID_RESPONSE
-    assert str(error).startswith(
-        "Evaluation batch (rows 2-2): Invalid evidence for comment_id=1,"
+    assert str(error) == (
+        "Evaluation batch (rows 2-2): Classification IDs mismatch: expected=[1], received=[2]."
     )
     assert example.comment not in str(error)
     assert error.request_id == REQUEST_HEADERS["x-request-id"]
@@ -448,13 +644,13 @@ def test_evaluation_tracks_attempts_without_counting_comments_twice(
         ([], "ConnectionCheck", "GROQ_MAX_OUTPUT_TOKENS", 256),
         (
             ["classify", "comments.json"],
-            "ClassificationPlan",
+            "GroqClassificationResponse",
             "GROQ_CLASSIFICATION_MAX_OUTPUT_TOKENS",
             512,
         ),
         (
             ["evaluate", "cases.json", "--batch-size", "4"],
-            "ClassificationPlan",
+            "GroqClassificationResponse",
             "GROQ_CLASSIFICATION_MAX_OUTPUT_TOKENS",
             512,
         ),
@@ -897,3 +1093,33 @@ def test_ranking_rejects_invented_kpi_or_amount(change: dict) -> None:
             client, _report(6, _metrics()), "Какой источник принёс больше всего денег?"
         )
     assert caught.value.code == LLMErrorCode.INVALID_RESPONSE
+
+
+def test_short_comment_evidence_is_canonicalized() -> None:
+    comment = "Стоимость обучения слишком высокая."
+
+    plan = _classification_reply(
+        _classification(
+            1,
+            "price",
+            "Курс слишком дорогой.",
+        )
+    )
+
+    with _client([plan]) as client:
+        result = classify_rejections(client, [comment])
+
+    (item,) = result.output.classifications
+
+    assert item.reason is RejectionReason.PRICE
+    assert item.evidence == comment
+    assert result.output.counts[RejectionReason.PRICE] == 1
+
+
+def test_missing_evidence_uses_full_comment_at_length_limit() -> None:
+    comment = "Слишком дорого".ljust(MAX_EVIDENCE_CHARS, "!")
+    reply = _classification_reply(_classification(1, "price", None))
+    with _client([reply]) as client:
+        result = classify_rejections(client, [comment])
+    (item,) = result.output.classifications
+    assert item.evidence == comment

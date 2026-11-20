@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -28,6 +29,7 @@ from app.core.config import LLMSettings
 
 if TYPE_CHECKING:
     from httpx import Client
+    from openai.types.chat import ChatCompletionMessageParam
 
 logger = logging.getLogger(__name__)
 GROQ_BASE_URL = "https://api.groq.com/openai/v1"
@@ -62,6 +64,9 @@ class LLMOperation(StrEnum):
     SUMMARY = "summary"
 
 
+type LLMResponseMode = Literal["json_schema", "json_object"]
+
+
 @dataclass(frozen=True, slots=True)
 class LLMRequestSettings:
     model: str
@@ -87,6 +92,11 @@ class LLMResult[OutputT: BaseModel]:
     request_id: str | None
     usage: LLMUsage | None
     retry_usage: tuple[LLMUsage | None, ...] = ()
+    response_mode: LLMResponseMode = "json_schema"
+
+    @property
+    def attempts(self) -> int:
+        return 1 + len(self.retry_usage)
 
     def with_output[ResultT: BaseModel](self, output: ResultT) -> LLMResult[ResultT]:
         return LLMResult(
@@ -96,6 +106,7 @@ class LLMResult[OutputT: BaseModel]:
             self.request_id,
             self.usage,
             self.retry_usage,
+            self.response_mode,
         )
 
     def invalid_response(self, message: str) -> LLMError:
@@ -106,6 +117,7 @@ class LLMResult[OutputT: BaseModel]:
             usage=self.usage,
             model=self.model,
             retry_usage=self.retry_usage,
+            response_mode=self.response_mode,
         )
 
 
@@ -119,6 +131,7 @@ class LLMError(Exception):
         usage: LLMUsage | None = None,
         model: str | None = None,
         retry_usage: tuple[LLMUsage | None, ...] = (),
+        response_mode: LLMResponseMode | None = "json_schema",
     ) -> None:
         super().__init__(message)
         self.code = code
@@ -126,22 +139,20 @@ class LLMError(Exception):
         self.usage = usage
         self.model = model
         self.retry_usage = retry_usage
+        self.response_mode = response_mode
+
+    @property
+    def attempts(self) -> int:
+        return 1 + len(self.retry_usage) if self.response_mode is not None else 0
 
 
 def _status_error(
     error: APIStatusError,
     usage: LLMUsage | None,
     retry_usage: tuple[LLMUsage | None, ...],
+    response_mode: LLMResponseMode,
 ) -> LLMError:
-    if (
-        error.status_code == HTTPStatus.BAD_REQUEST
-        and error.code == "json_validate_failed"
-    ):
-        code, message = (
-            LLMErrorCode.INVALID_RESPONSE,
-            "Groq rejected generated JSON (HTTP 400, json_validate_failed).",
-        )
-    elif error.status_code in {HTTPStatus.UNAUTHORIZED, HTTPStatus.FORBIDDEN}:
+    if error.status_code in {HTTPStatus.UNAUTHORIZED, HTTPStatus.FORBIDDEN}:
         code, message = (
             LLMErrorCode.AUTHENTICATION,
             "Check the API key and model access.",
@@ -154,6 +165,14 @@ def _status_error(
         or error.type in QUOTA_CODES
     ):
         code, message = LLMErrorCode.QUOTA, "The provider quota is exhausted."
+    elif (
+        error.status_code == HTTPStatus.BAD_REQUEST
+        and error.code == "json_validate_failed"
+    ):
+        code, message = (
+            LLMErrorCode.INVALID_RESPONSE,
+            "Groq rejected generated JSON (HTTP 400, json_validate_failed).",
+        )
     elif error.status_code == HTTPStatus.TOO_MANY_REQUESTS:
         code, message = LLMErrorCode.RATE_LIMIT, "The provider rate limit was reached."
     elif error.status_code >= HTTPStatus.INTERNAL_SERVER_ERROR:
@@ -167,7 +186,12 @@ def _status_error(
             "The provider rejected the request.",
         )
     return LLMError(
-        code, message, request_id=error.request_id, usage=usage, retry_usage=retry_usage
+        code,
+        message,
+        request_id=error.request_id,
+        usage=usage,
+        retry_usage=retry_usage,
+        response_mode=response_mode,
     )
 
 
@@ -265,26 +289,25 @@ class LLMClient:
     ) -> LLMResult[OutputT]:
         if not instructions.strip() or not prompt.strip():
             raise LLMError(
-                LLMErrorCode.INVALID_INPUT, "Instructions and prompt must be non-empty."
+                LLMErrorCode.INVALID_INPUT,
+                "Instructions and prompt must be non-empty.",
+                response_mode=None,
             )
         settings = self.request_settings(operation)
         if len(instructions) + len(prompt) > settings.max_input_chars:
             raise LLMError(
                 LLMErrorCode.INVALID_INPUT,
                 "The input exceeds the configured character limit.",
+                response_mode=None,
             )
 
         retry_usage: list[LLMUsage | None] = []
+        response_mode: LLMResponseMode = "json_schema"
+        previous_schema_failure = False
         while True:
             try:
-                raw = self._client.chat.completions.with_raw_response.parse(
-                    model=settings.model,
-                    messages=[
-                        {"role": "system", "content": instructions},
-                        {"role": "user", "content": prompt},
-                    ],
-                    response_format=schema,
-                    max_completion_tokens=settings.max_output_tokens,
+                content, request_id = self._request_completion(
+                    settings, instructions, prompt, schema, response_mode
                 )
                 break
             except APITimeoutError:
@@ -292,20 +315,19 @@ class LLMClient:
                     LLMErrorCode.TIMEOUT,
                     "The provider request timed out.",
                     retry_usage=tuple(retry_usage),
+                    response_mode=response_mode,
                 ) from None
             except APIConnectionError:
                 raise LLMError(
                     LLMErrorCode.UNAVAILABLE,
                     "Could not connect to the provider.",
                     retry_usage=tuple(retry_usage),
+                    response_mode=response_mode,
                 ) from None
             except APIStatusError as error:
                 usage = self._error_usage(error)
-                failure = _status_error(error, usage, tuple(retry_usage))
-                provider_schema_failure = (
-                    error.status_code == HTTPStatus.BAD_REQUEST
-                    and error.code == "json_validate_failed"
-                )
+                failure = _status_error(error, usage, tuple(retry_usage), response_mode)
+                provider_schema_failure = failure.code is LLMErrorCode.INVALID_RESPONSE
                 temporary = (
                     provider_schema_failure
                     or failure.code is LLMErrorCode.RATE_LIMIT
@@ -314,19 +336,71 @@ class LLMClient:
                         and error.status_code in TRANSIENT_SERVER_ERRORS
                     )
                 )
-                if not temporary or len(retry_usage) + 1 >= MAX_ATTEMPTS:
+                if (
+                    response_mode == "json_object"
+                    or not temporary
+                    or failure.attempts >= MAX_ATTEMPTS
+                ):
                     raise failure from None
                 delay = _retry_delay(
                     error.response.headers.get("retry-after"), len(retry_usage)
                 )
                 if delay is None:
                     raise failure from None
+                if (
+                    operation is LLMOperation.CLASSIFICATION
+                    and provider_schema_failure
+                    and previous_schema_failure
+                ):
+                    json_schema = json.dumps(
+                        schema.model_json_schema(),
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    )
+                    fallback_instructions = f"{instructions}\nВерни только JSON-объект, соответствующий схеме:\n{json_schema}"
+                    if (
+                        len(fallback_instructions) + len(prompt)
+                        > settings.max_input_chars
+                    ):
+                        raise failure from None
+                    response_mode = "json_object"
+                    instructions = fallback_instructions
+                previous_schema_failure = provider_schema_failure
                 retry_usage.append(usage)
                 sleep(delay)
 
         return self._parse_completion(
-            raw.content, raw.headers.get("x-request-id"), schema, tuple(retry_usage)
+            content, request_id, schema, tuple(retry_usage), response_mode
         )
+
+    def _request_completion(
+        self,
+        settings: LLMRequestSettings,
+        instructions: str,
+        prompt: str,
+        schema: type[BaseModel],
+        response_mode: LLMResponseMode,
+    ) -> tuple[bytes, str | None]:
+        messages: list[ChatCompletionMessageParam] = [
+            {"role": "system", "content": instructions},
+            {"role": "user", "content": prompt},
+        ]
+        api = self._client.chat.completions.with_raw_response
+        if response_mode == "json_object":
+            raw = api.create(
+                model=settings.model,
+                messages=messages,
+                response_format={"type": "json_object"},
+                max_completion_tokens=settings.max_output_tokens,
+            )
+        else:
+            raw = api.parse(
+                model=settings.model,
+                messages=messages,
+                response_format=schema,
+                max_completion_tokens=settings.max_output_tokens,
+            )
+        return raw.content, raw.headers.get("x-request-id")
 
     def _parse_completion[OutputT: BaseModel](
         self,
@@ -334,6 +408,7 @@ class LLMClient:
         request_id: str | None,
         schema: type[OutputT],
         retry_usage: tuple[LLMUsage | None, ...],
+        response_mode: LLMResponseMode,
     ) -> LLMResult[OutputT]:
         try:
             response = _GroqCompletion.model_validate_json(content, strict=True)
@@ -346,12 +421,14 @@ class LLMClient:
                 "The provider returned invalid response metadata.",
                 request_id=request_id,
                 retry_usage=retry_usage,
+                response_mode=response_mode,
             ) from None
         (choice,) = response.choices
         logger.info(
-            "LLM response model=%s request_id=%s status=%s usage=%s",
+            "LLM response model=%s request_id=%s mode=%s status=%s usage=%s",
             response.model,
             request_id,
+            response_mode,
             choice.finish_reason,
             usage,
         )
@@ -362,6 +439,7 @@ class LLMClient:
                 usage=usage,
                 model=response.model,
                 retry_usage=retry_usage,
+                response_mode=response_mode,
             )
         try:
             output = schema.model_validate_json(
@@ -375,9 +453,16 @@ class LLMClient:
                 usage=usage,
                 model=response.model,
                 retry_usage=retry_usage,
+                response_mode=response_mode,
             ) from None
         return LLMResult(
-            output, response.model, response.id, request_id, usage, retry_usage
+            output,
+            response.model,
+            response.id,
+            request_id,
+            usage,
+            retry_usage,
+            response_mode,
         )
 
     def _error_usage(self, error: APIStatusError) -> LLMUsage | None:

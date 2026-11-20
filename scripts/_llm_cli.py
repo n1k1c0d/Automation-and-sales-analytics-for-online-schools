@@ -22,11 +22,16 @@ def _retry_payload(attempts: tuple[LLMUsage | None, ...]) -> list[dict | None]:
 
 
 def print_error_usage(error: LLMError) -> None:
-    if error.retry_usage:
-        print(
-            json.dumps({"retry_usage": _retry_payload(error.retry_usage)}, default=str),
-            file=sys.stderr,
-        )
+    if error.response_mode is not None:
+        metadata: dict[str, object] = {
+            "response_mode": error.response_mode,
+            "attempts": error.attempts,
+        }
+        if error.retry_usage:
+            metadata["retry_usage"] = _retry_payload(error.retry_usage)
+        if error.usage is None:
+            metadata["usage"] = None
+        print(json.dumps(metadata, default=str), file=sys.stderr)
     if error.usage is not None:
         print(json.dumps(asdict(error.usage), default=str), file=sys.stderr)
 
@@ -37,6 +42,8 @@ def result_payload(result: LLMResult) -> dict[str, object]:
         "model": result.model,
         "response_id": result.response_id,
         "request_id": result.request_id,
+        "response_mode": result.response_mode,
+        "attempts": result.attempts,
         "usage": asdict(result.usage) if result.usage is not None else None,
     }
     if result.retry_usage:

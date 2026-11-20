@@ -44,7 +44,7 @@ def _arguments(argv: Sequence[str] | None) -> argparse.Namespace:
         "--batch-size",
         type=int,
         choices=range(1, MAX_COMMENTS + 1),
-        default=MAX_COMMENTS,
+        default=2,
     )
     summarize = commands.add_parser(
         "summarize", help="Summarize a sales_report JSON file."

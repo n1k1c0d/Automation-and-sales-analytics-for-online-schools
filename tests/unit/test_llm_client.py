@@ -12,7 +12,7 @@ from pydantic import BaseModel, ValidationError
 
 from app.ai import client as llm
 from app.ai.client import LLMClient, LLMError, LLMErrorCode, LLMOperation, LLMUsage
-from app.ai.rejections import MAX_COMMENTS, MAX_EVIDENCE_CHARS, ClassificationPlan
+from app.ai.rejections import GroqClassificationResponse, RejectionReason
 from app.ai.sales_analysis import QuestionPlan, SummaryPlan
 from app.core.config import LLMSettings, PostgresSettings
 from app.schemas.sales_report import SalesMetrics
@@ -79,11 +79,13 @@ def _generate(
     *,
     prompt: str = "A synthetic prompt.",
     schema: type[BaseModel] = ConnectionCheck,
+    operation: LLMOperation | None = None,
 ):
     return client.generate(
         instructions="Return the requested status.",
         prompt=prompt,
         schema=schema,
+        operation=operation,
     )
 
 
@@ -139,6 +141,7 @@ def test_uses_strict_structured_outputs_and_accounts_for_usage(
     assert json_schema["schema"]["required"] == ["status"]
     assert result.output == ConnectionCheck(status="ok")
     assert result.model == "qwen-test" and result.response_id == "chatcmpl-test"
+    assert result.response_mode == "json_schema" and result.attempts == 1
     assert result.request_id == REQUEST_ID
     assert result.usage == LLMUsage(900, 400, 100, 1000, Decimal("0.002"))
     assert "total_tokens=1000" in caplog.text
@@ -223,7 +226,7 @@ UNCLEAR = {"comment_id": 1, "reason": "unclear", "evidence": None}
     ("schema", "example"),
     [
         (ConnectionCheck, {"status": "ok"}),
-        (ClassificationPlan, {"classifications": [UNCLEAR]}),
+        (GroqClassificationResponse, {"classifications": [UNCLEAR]}),
         (
             SummaryPlan,
             {
@@ -253,19 +256,21 @@ def test_production_structured_output_contract(
         assert descriptor["strict"] is True
         definition = descriptor["schema"]
         _assert_closed_objects(definition)
-        if schema is ClassificationPlan:
+        if schema is GroqClassificationResponse:
             batch = definition["properties"]["classifications"]
-            assert (batch["minItems"], batch["maxItems"]) == (1, MAX_COMMENTS)
-            item = definition["$defs"]["RejectionClassification"]
-            identifier = item["properties"]["comment_id"]
-            assert (identifier["minimum"], identifier["maximum"]) == (1, MAX_COMMENTS)
-            evidence = item["properties"]["evidence"]["anyOf"]
-            assert {"type": "null"} in evidence
-            assert {
-                "type": "string",
-                "minLength": 1,
-                "maxLength": MAX_EVIDENCE_CHARS,
-            } in evidence
+            assert batch["type"] == "array"
+            assert {"minItems", "maxItems"}.isdisjoint(batch)
+            assert batch["items"]["$ref"] == "#/$defs/GroqClassificationItem"
+            fields = definition["$defs"]["GroqClassificationItem"]["properties"]
+            identifier = fields["comment_id"]
+            assert identifier["type"] == "integer"
+            assert {"minimum", "maximum"}.isdisjoint(identifier)
+            assert {"type": "string"} in fields["evidence"]["anyOf"]
+            assert {"type": "null"} in fields["evidence"]["anyOf"]
+            assert fields["reason"]["$ref"] == "#/$defs/RejectionReason"
+            assert set(definition["$defs"]["RejectionReason"]["enum"]) == set(
+                RejectionReason
+            )
         if schema is QuestionPlan:
             assert {"type": "null"} in definition["properties"]["ranking"]["anyOf"]
         if schema in (SummaryPlan, QuestionPlan):
@@ -285,10 +290,16 @@ def test_production_structured_output_contract(
     [
         (ConnectionCheck, {"status": "ok", "detail": True}),
         (ConnectionCheck, {"status": 1}),
-        (ClassificationPlan, {"classifications": [UNCLEAR | {"comment_id": "1"}]}),
-        (ClassificationPlan, {"classifications": [UNCLEAR | {"note": "extra"}]}),
         (
-            ClassificationPlan,
+            GroqClassificationResponse,
+            {"classifications": [UNCLEAR | {"comment_id": "1"}]},
+        ),
+        (
+            GroqClassificationResponse,
+            {"classifications": [UNCLEAR | {"note": "extra"}]},
+        ),
+        (
+            GroqClassificationResponse,
             {"classifications": [{"comment_id": 1, "reason": "unclear"}]},
         ),
         (SummaryPlan, {"metrics": [METRIC | {"metric": 1}], "hypotheses": []}),
@@ -365,7 +376,7 @@ def test_local_pydantic_validation_rejects_invalid_output_without_retry(
     ],
 )
 @pytest.mark.parametrize(
-    "schema", [ConnectionCheck, ClassificationPlan, SummaryPlan, QuestionPlan]
+    "schema", [ConnectionCheck, GroqClassificationResponse, SummaryPlan, QuestionPlan]
 )
 def test_unsuccessful_generation_preserves_usage(
     schema: type[BaseModel],
@@ -436,18 +447,106 @@ def test_provider_status_and_retry_bound(
         LLMClient(_settings(), http_client=_http_client(respond)) as client,
         pytest.raises(LLMError) as caught,
     ):
-        _generate(client)
+        _generate(
+            client,
+            schema=GroqClassificationResponse,
+            operation=LLMOperation.CLASSIFICATION,
+        )
     assert caught.value.code == expected
     assert caught.value.request_id == REQUEST_ID and caught.value.usage is None
     assert PROVIDER_MESSAGE not in str(caught.value)
     assert len(calls) == attempts
     assert waits == [1.25, 2.25][: attempts - 1]
     assert caught.value.retry_usage == (None,) * (attempts - 1)
+    modes = [json.loads(call.content)["response_format"]["type"] for call in calls]
+    expected_modes = ["json_schema"] * attempts
     if provider_code == "json_validate_failed":
+        expected_modes[-1] = "json_object"
         assert (
             str(caught.value)
             == "Groq rejected generated JSON (HTTP 400, json_validate_failed)."
         )
+    assert modes == expected_modes
+    assert caught.value.response_mode == modes[-1] and caught.value.attempts == attempts
+
+
+@pytest.mark.parametrize(
+    ("schema", "operation"),
+    [
+        (ConnectionCheck, None),
+        (QuestionPlan, None),
+        (SummaryPlan, LLMOperation.SUMMARY),
+    ],
+)
+def test_other_operations_keep_strict_schema_after_repeated_generation_failure(
+    schema: type[BaseModel],
+    operation: LLMOperation | None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    modes = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        modes.append(json.loads(request.content)["response_format"]["type"])
+        return httpx.Response(400, json={"error": {"code": "json_validate_failed"}})
+
+    monkeypatch.setattr(llm, "sleep", lambda _: None)
+    with (
+        LLMClient(_settings(), http_client=_http_client(respond)) as client,
+        pytest.raises(LLMError) as caught,
+    ):
+        _generate(client, schema=schema, operation=operation)
+    assert caught.value.code == LLMErrorCode.INVALID_RESPONSE
+    assert modes == ["json_schema"] * 3
+
+
+@pytest.mark.parametrize("statuses", [(400, 503), (429, 400)])
+def test_classification_keeps_strict_mode_after_mixed_errors(
+    statuses: tuple[int, int], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    modes = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        modes.append(json.loads(request.content)["response_format"]["type"])
+        if len(modes) <= len(statuses):
+            status = statuses[len(modes) - 1]
+            code = "json_validate_failed" if status == 400 else "temporary"
+            return httpx.Response(status, json={"error": {"code": code}})
+        return httpx.Response(
+            200, json=_payload(json.dumps({"classifications": [UNCLEAR]}))
+        )
+
+    monkeypatch.setattr(llm, "sleep", lambda _: None)
+    with LLMClient(_settings(), http_client=_http_client(respond)) as client:
+        result = _generate(
+            client,
+            schema=GroqClassificationResponse,
+            operation=LLMOperation.CLASSIFICATION,
+        )
+    assert modes == ["json_schema"] * 3
+    assert result.response_mode == "json_schema" and result.attempts == 3
+
+
+def test_json_fallback_respects_input_budget(monkeypatch: pytest.MonkeyPatch) -> None:
+    modes = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        modes.append(json.loads(request.content)["response_format"]["type"])
+        return httpx.Response(400, json={"error": {"code": "json_validate_failed"}})
+
+    monkeypatch.setattr(llm, "sleep", lambda _: None)
+    with (
+        LLMClient(
+            _settings(max_input_chars=100), http_client=_http_client(respond)
+        ) as client,
+        pytest.raises(LLMError) as caught,
+    ):
+        _generate(
+            client,
+            schema=GroqClassificationResponse,
+            operation=LLMOperation.CLASSIFICATION,
+        )
+    assert modes == ["json_schema", "json_schema"]
+    assert caught.value.response_mode == "json_schema" and caught.value.attempts == 2
 
 
 def test_provider_json_validation_failure_recovers_on_second_attempt(

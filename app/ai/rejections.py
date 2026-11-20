@@ -6,7 +6,7 @@ from enum import StrEnum
 from itertools import batched, islice
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from app.ai.client import (
     LLMClient,
@@ -14,6 +14,7 @@ from app.ai.client import (
     LLMErrorCode,
     LLMOperation,
     LLMRequestSettings,
+    LLMResponseMode,
     LLMResult,
     LLMUsage,
 )
@@ -73,6 +74,20 @@ class ClassificationPlan(BaseModel):
     )
 
 
+class GroqClassificationItem(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    comment_id: int
+    reason: RejectionReason
+    evidence: str | None
+
+
+class GroqClassificationResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    classifications: list[GroqClassificationItem]
+
+
 class RejectionAnalysis(BaseModel):
     classifications: list[RejectionClassification]
     counts: dict[RejectionReason, int]
@@ -103,6 +118,7 @@ class EvaluationBatch(BaseModel):
     model: str | None
     request_id: str | None
     attempts: int = 1
+    response_mode: LLMResponseMode = "json_schema"
 
 
 class ClassificationEvaluation(BaseModel):
@@ -137,7 +153,7 @@ def classify_rejections(
 
     indexed = dict(enumerate(comments, start=1))
     expected_ids = list(indexed)
-    result = client.generate(
+    provider_result = client.generate(
         instructions=(
             f"{CLASSIFICATION_INSTRUCTIONS}\n"
             f"Число записей в classifications: {len(indexed)}. "
@@ -150,9 +166,18 @@ def classify_rejections(
             ],
             ensure_ascii=False,
         ),
-        schema=ClassificationPlan,
+        schema=GroqClassificationResponse,
         operation=LLMOperation.CLASSIFICATION,
     )
+    try:
+        validated = ClassificationPlan.model_validate(
+            provider_result.output.model_dump(), strict=True, extra="forbid"
+        )
+    except ValidationError:
+        raise provider_result.invalid_response(
+            "Classification failed local business schema validation."
+        ) from None
+    result = provider_result.with_output(validated)
     received_ids = [item.comment_id for item in result.output.classifications]
     if sorted(received_ids) != expected_ids:
         raise result.invalid_response(
@@ -162,28 +187,50 @@ def classify_rejections(
 
     counts = dict.fromkeys(RejectionReason, 0)
     classifications = []
+
     for comment_id, comment in indexed.items():
         item = classified[comment_id]
+
+        # Python формирует evidence для коротких комментариев.
+        # Модель отвечает только за выбор категории.
+        if item.reason is RejectionReason.UNCLEAR:
+            item = item.model_copy(update={"evidence": None})
+        elif len(comment) <= MAX_EVIDENCE_CHARS:
+            item = item.model_copy(update={"evidence": comment})
+
         evidence = item.evidence
         exact_substring = bool(evidence and evidence in comment)
+
         if item.reason is RejectionReason.UNCLEAR:
-            if evidence is not None:
-                item = item.model_copy(update={"evidence": None})
-        elif not (
-            evidence
-            and evidence.strip()
-            and len(evidence) <= MAX_EVIDENCE_CHARS
-            and exact_substring
-        ):
+            valid = evidence is None
+        else:
+            valid = bool(
+                evidence
+                and evidence.strip()
+                and len(evidence) <= MAX_EVIDENCE_CHARS
+                and exact_substring
+            )
+
+        if not valid:
             raise result.invalid_response(
-                f"Invalid evidence for comment_id={comment_id}, reason={item.reason.value}, "
-                f"is_null={evidence is None}, length={len(evidence) if evidence else 0}, "
+                f"Invalid evidence for comment_id={comment_id}, "
+                f"reason={item.reason.value}, "
+                f"is_null={evidence is None}, "
+                f"length={len(evidence) if evidence else 0}, "
                 f"exact_substring={exact_substring}."
             )
+
+        # Эти две операции обязательно внутри for,
+        # но вне всех условных веток.
         counts[item.reason] += 1
         classifications.append(item)
+
+    # Возвращаем результат только после завершения цикла.
     return result.with_output(
-        RejectionAnalysis(classifications=classifications, counts=counts)
+        RejectionAnalysis(
+            classifications=classifications,
+            counts=counts,
+        )
     )
 
 
@@ -219,6 +266,7 @@ def evaluate_rejections(
                     usage=exc.usage,
                     model=exc.model,
                     retry_usage=exc.retry_usage,
+                    response_mode=exc.response_mode,
                 ) from None
             if exc.code is not LLMErrorCode.OUTPUT_LIMIT:
                 raise
@@ -231,7 +279,8 @@ def evaluate_rejections(
                     status="output_limit",
                     model=exc.model,
                     request_id=exc.request_id,
-                    attempts=1 + len(exc.retry_usage),
+                    attempts=exc.attempts,
+                    response_mode=exc.response_mode,
                 )
             )
             usage.extend((*exc.retry_usage, exc.usage))
@@ -244,7 +293,8 @@ def evaluate_rejections(
                 status="completed",
                 model=result.model,
                 request_id=result.request_id,
-                attempts=1 + len(result.retry_usage),
+                attempts=result.attempts,
+                response_mode=result.response_mode,
             )
         )
         usage.extend((*result.retry_usage, result.usage))
