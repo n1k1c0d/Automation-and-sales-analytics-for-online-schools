@@ -1,4 +1,5 @@
 import json
+import logging
 from collections.abc import Iterable
 from datetime import date
 from decimal import Decimal
@@ -14,6 +15,7 @@ from app.ai.client import LLMClient, LLMError, LLMErrorCode
 from app.ai.comment_privacy import CommentPrivacyError, check_comment_privacy
 from app.ai.rejections import (
     MAX_COMMENTS,
+    MAX_EVIDENCE_CHARS,
     LabeledComment,
     RejectionReason,
     classify_rejections,
@@ -216,6 +218,104 @@ def test_evidence_must_belong_to_the_same_comment() -> None:
     with _client([plan]) as client, pytest.raises(LLMError) as caught:
         classify_rejections(client, comments)
     assert caught.value.code == LLMErrorCode.INVALID_RESPONSE
+
+
+def test_four_comments_accept_verbatim_evidence_and_unclear_null() -> None:
+    fragment = "Дорого".ljust(MAX_EVIDENCE_CHARS, "!")
+    comments = [
+        "Банк  отказал.",
+        "Дорого…",
+        "Причина такая: " + fragment,
+        "Причину не указали.",
+    ]
+    items = [
+        _classification(1, "bank_declined", comments[0]),
+        _classification(2, "price", comments[1]),
+        _classification(3, "price", fragment),
+        _classification(4, "unclear", None),
+    ]
+    with _client([_classification_reply(*items)]) as client:
+        result = classify_rejections(client, comments)
+    assert [
+        item.model_dump(mode="json") for item in result.output.classifications
+    ] == items
+
+
+@pytest.mark.parametrize("ids", [[1, 2, 2, 4], [1, 2, 4], [1, 2, 4, 5]])
+def test_id_error_identifies_missing_duplicate_or_foreign_ids(ids: list[int]) -> None:
+    items = [_classification(number, "unclear", None) for number in ids]
+    sent = []
+    with (
+        _client([_classification_reply(*items)], sent) as client,
+        pytest.raises(LLMError) as caught,
+    ):
+        classify_rejections(client, ["Причину не указали."] * 4)
+    assert caught.value.code == LLMErrorCode.INVALID_RESPONSE
+    assert (
+        str(caught.value)
+        == f"Classification IDs mismatch: expected=[1, 2, 3, 4], received={ids}."
+    )
+    assert caught.value.request_id == REQUEST_HEADERS["x-request-id"] and len(sent) == 1
+
+
+@pytest.mark.parametrize(
+    ("reason", "evidence", "exact"),
+    [
+        ("price", "Курс слишком дорогой.", False),
+        ("price", None, False),
+        ("unclear", "выше бюджета", True),
+    ],
+)
+def test_evidence_error_reports_only_safe_metadata(
+    reason: str, evidence: str | None, exact: bool, caplog: pytest.LogCaptureFixture
+) -> None:
+    comment = "Стоимость выше бюджета."
+    plan = _classification_reply(_classification(1, reason, evidence))
+    sent = []
+    with (
+        caplog.at_level(logging.INFO),
+        _client([plan], sent) as client,
+        pytest.raises(LLMError) as caught,
+    ):
+        classify_rejections(client, [comment])
+    assert caught.value.code == LLMErrorCode.INVALID_RESPONSE
+    assert str(caught.value) == (
+        f"Invalid evidence for comment_id=1, reason={reason}, is_null={evidence is None}, "
+        f"length={len(evidence or '')}, exact_substring={exact}."
+    )
+    diagnostics = str(caught.value) + caplog.text
+    assert comment not in diagnostics and "test-key" not in diagnostics
+    if evidence:
+        assert evidence not in diagnostics
+    assert len(sent) == 1 and caught.value.usage is not None
+
+
+def test_overlong_verbatim_evidence_fails_local_schema_once() -> None:
+    evidence = "Дорого".ljust(MAX_EVIDENCE_CHARS + 1, "!")
+    plan = _classification_reply(_classification(1, "price", evidence))
+    sent = []
+    with _client([plan], sent) as client, pytest.raises(LLMError) as caught:
+        classify_rejections(client, [evidence])
+    assert caught.value.code == LLMErrorCode.INVALID_RESPONSE
+    assert "failed local Pydantic validation" in str(caught.value)
+    assert len(sent) == 1 and evidence not in str(caught.value)
+
+
+def test_evaluation_error_locates_the_batch_and_preserves_the_cause() -> None:
+    example = LabeledComment(comment="Причину не сообщили.", expected="unclear")
+    ok = _classification_reply(_classification(1, "unclear", None))
+    invalid = _classification_reply(_classification(1, "unclear", example.comment))
+    sent = []
+    with _client([ok, invalid], sent) as client, pytest.raises(LLMError) as caught:
+        evaluate_rejections(client, [example] * 3, batch_size=1)
+    error = caught.value
+    assert error.code == LLMErrorCode.INVALID_RESPONSE
+    assert str(error).startswith(
+        "Evaluation batch (rows 2-2): Invalid evidence for comment_id=1,"
+    )
+    assert example.comment not in str(error)
+    assert error.request_id == REQUEST_HEADERS["x-request-id"]
+    assert error.usage is not None and error.retry_usage == () and len(sent) == 2
 
 
 def test_evaluation_scores_labeled_examples_without_sending_the_labels() -> None:
