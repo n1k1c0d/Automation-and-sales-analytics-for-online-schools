@@ -321,18 +321,23 @@ def test_production_structured_output_contract(
         "ranking-extra",
     ],
 )
-def test_production_schema_rejects_invalid_output(
+def test_local_pydantic_validation_rejects_invalid_output_without_retry(
     schema: type[BaseModel], invalid: dict
 ) -> None:
-    transport = _http_client(
-        lambda _: httpx.Response(200, json=_payload(json.dumps(invalid)))
-    )
+    requests = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, json=_payload(json.dumps(invalid)))
+
     with (
-        LLMClient(_settings(), http_client=transport) as client,
+        LLMClient(_settings(), http_client=_http_client(respond)) as client,
         pytest.raises(LLMError) as caught,
     ):
         _generate(client, schema=schema)
     assert caught.value.code == LLMErrorCode.INVALID_RESPONSE
+    assert str(caught.value) == "The returned JSON failed local Pydantic validation."
+    assert len(requests) == 1 and caught.value.retry_usage == ()
 
 
 @pytest.mark.parametrize(
@@ -393,7 +398,7 @@ def test_unsuccessful_generation_preserves_usage(
     ("status", "provider_code", "expected", "attempts"),
     [
         (400, "invalid_request", LLMErrorCode.REQUEST_REJECTED, 1),
-        (400, "json_validate_failed", LLMErrorCode.INVALID_RESPONSE, 1),
+        (400, "json_validate_failed", LLMErrorCode.INVALID_RESPONSE, 3),
         (401, "invalid_api_key", LLMErrorCode.AUTHENTICATION, 1),
         (403, "permission_denied", LLMErrorCode.AUTHENTICATION, 1),
         (408, "timeout", LLMErrorCode.TIMEOUT, 1),
@@ -438,6 +443,49 @@ def test_provider_status_and_retry_bound(
     assert len(calls) == attempts
     assert waits == [1.25, 2.25][: attempts - 1]
     assert caught.value.retry_usage == (None,) * (attempts - 1)
+    if provider_code == "json_validate_failed":
+        assert (
+            str(caught.value)
+            == "Groq rejected generated JSON (HTTP 400, json_validate_failed)."
+        )
+
+
+def test_provider_json_validation_failure_recovers_on_second_attempt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    requests = []
+    waits = []
+    monkeypatch.setattr(llm, "sleep", waits.append)
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if len(requests) == 1:
+            return httpx.Response(
+                400,
+                json={
+                    "error": {
+                        "code": "json_validate_failed",
+                        "message": PROVIDER_MESSAGE,
+                    },
+                    "usage": {
+                        "prompt_tokens": 20,
+                        "completion_tokens": 4,
+                        "total_tokens": 24,
+                    },
+                },
+            )
+        return httpx.Response(200, headers=REQUEST_HEADERS, json=_payload())
+
+    with LLMClient(_settings(), http_client=_http_client(respond)) as client:
+        result = _generate(client)
+    first, second = requests
+    assert first.content == second.content and len(waits) == 1
+    assert isinstance(result, llm.LLMResult) and result.output == ConnectionCheck(
+        status="ok"
+    )
+    assert result.request_id == REQUEST_ID
+    assert result.retry_usage == (LLMUsage(20, None, 4, 24, None),)
+    assert result.usage == LLMUsage(900, 400, 100, 1000, None)
 
 
 @pytest.mark.parametrize(

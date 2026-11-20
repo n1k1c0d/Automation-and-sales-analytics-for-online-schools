@@ -139,7 +139,7 @@ def _status_error(
     ):
         code, message = (
             LLMErrorCode.INVALID_RESPONSE,
-            "The generated output does not match the requested schema.",
+            "Groq rejected generated JSON (HTTP 400, json_validate_failed).",
         )
     elif error.status_code in {HTTPStatus.UNAUTHORIZED, HTTPStatus.FORBIDDEN}:
         code, message = (
@@ -302,9 +302,17 @@ class LLMClient:
             except APIStatusError as error:
                 usage = self._error_usage(error)
                 failure = _status_error(error, usage, tuple(retry_usage))
-                temporary = failure.code is LLMErrorCode.RATE_LIMIT or (
-                    failure.code is LLMErrorCode.UNAVAILABLE
-                    and error.status_code in TRANSIENT_SERVER_ERRORS
+                provider_schema_failure = (
+                    error.status_code == HTTPStatus.BAD_REQUEST
+                    and error.code == "json_validate_failed"
+                )
+                temporary = (
+                    provider_schema_failure
+                    or failure.code is LLMErrorCode.RATE_LIMIT
+                    or (
+                        failure.code is LLMErrorCode.UNAVAILABLE
+                        and error.status_code in TRANSIENT_SERVER_ERRORS
+                    )
                 )
                 if not temporary or len(retry_usage) + 1 >= MAX_ATTEMPTS:
                     raise failure from None
@@ -362,7 +370,7 @@ class LLMClient:
         except ValidationError:
             raise LLMError(
                 LLMErrorCode.INVALID_RESPONSE,
-                "The generated output does not match the requested schema.",
+                "The returned JSON failed local Pydantic validation.",
                 request_id=request_id,
                 usage=usage,
                 model=response.model,

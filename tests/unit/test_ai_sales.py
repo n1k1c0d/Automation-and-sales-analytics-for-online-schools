@@ -256,7 +256,13 @@ def test_evaluation_scores_labeled_examples_without_sending_the_labels() -> None
     assert evaluation.settings.max_output_tokens == 2048
 
 
+@pytest.mark.parametrize(
+    ("retry_status", "retry_code"),
+    [(429, "rate_limit_exceeded"), (400, "json_validate_failed")],
+)
 def test_evaluation_tracks_attempts_without_counting_comments_twice(
+    retry_status: int,
+    retry_code: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     sent = []
@@ -283,9 +289,9 @@ def test_evaluation_tracks_attempts_without_counting_comments_twice(
             payload = _payload('{"classifications":', finish_reason="length")
         elif len(sent) == 3:
             return httpx.Response(
-                429,
-                headers={"Retry-After": "2"},
-                json={"error": {"code": "rate_limit_exceeded"}},
+                retry_status,
+                headers={"Retry-After": "2"} if retry_status == 429 else {},
+                json={"error": {"code": retry_code}},
             )
         else:
             plan = _classification_reply(_classification(1, "price", "дорого"))
@@ -306,7 +312,8 @@ def test_evaluation_tracks_attempts_without_counting_comments_twice(
         report = evaluate_rejections(client, examples, batch_size=2)
     assert [len(batch) for batch in sent] == [2, 2, 1, 1]
     assert sent[0] == sent[1] and sent[2] == sent[3]
-    assert len(waits) == 2 and waits[1] >= 2
+    assert len(waits) == 2
+    assert waits[1] >= (2 if retry_status == 429 else 1)
     assert report.settings.model == "qwen/qwen3.8-27b"
     assert report.settings.max_output_tokens == 2048
     assert report.correct == 1 and report.accuracy_pct == Decimal("33.33")
