@@ -6,9 +6,10 @@ EduFlow AI — проект платформы аналитики и автом�
 
 FastAPI принимает CSV и Excel и возвращает KPI из PostgreSQL. Дашборд Streamlit показывает карточки KPI, динамику, воронку и срезы. Генератор, импорт и отчёт также доступны из командной строки. [Контракт API](docs/API.md), [запуск дашборда](#дашборд-streamlit), [список задач](docs/TASKS.md)
 
+AI-команды используют GroqCloud с моделью `qwen/qwen3.8-27b`. Модель выбирает причину отказа или нужный KPI. Суммы, конверсии и лидирующие источники приложение определяет по отчёту PostgreSQL. [Запуск AI-команд](#ai-команды-groqcloud)
+
 ## Планируемые возможности
 
-- Классификация обезличенных причин отказов и подготовка сводок по уже рассчитанным метрикам.
 - Регулярное формирование отчётов через n8n и отправка в Telegram.
 
 ## Стек и архитектура
@@ -19,7 +20,8 @@ FastAPI принимает CSV и Excel и возвращает KPI из Postgre
 | Хранение и миграции | PostgreSQL 16, SQLAlchemy 2.x, psycopg 3, Alembic |
 | Аналитика и интерфейс | SQL, Streamlit, Altair |
 | Окружение, проверки и инфраструктура | uv, pytest, Ruff, Git/GitHub, Docker Compose |
-| Последующие этапы | LLM API, Structured Outputs / JSON Schema, n8n, Telegram Bot API |
+| AI | GroqCloud, Qwen 3.8 27B, Chat Completions со строгой JSON Schema |
+| Планируемая автоматизация | n8n, Telegram Bot API |
 
 Backend — модульный монолит. PostgreSQL хранит события продаж, слой аналитики рассчитывает метрики, FastAPI отдаёт их через API, а Streamlit отображает результаты. LLM получает рассчитанные показатели и обезличенный текст. Подробнее в [архитектуре](docs/ARCHITECTURE.md).
 
@@ -80,7 +82,7 @@ uv run --locked python -m pytest --integration
 
 Интеграционные тесты используют параметры сервера из `.env`. Пользователю PostgreSQL нужен доступ к служебной базе `postgres` и право создавать базы. Тестовый прогон создаёт временные базы `eduflow_test_<uuid>`, применяет к ним миграции Alembic и удаляет их при завершении. Тесты проверяют запись и чтение, откат транзакции, ограничения схемы, импорт CSV и Excel и расчёт KPI, в том числе через REST API. Отдельный тест импортирует стандартные 500 лидов и сравнивает все 12 KPI с эталоном. Обычный запуск pytest пропускает проверки PostgreSQL. С флагом `--integration` недоступность PostgreSQL приводит к ошибке.
 
-Результаты проверок сохранены в отчётах [первого этапа](docs/TEST_REPORT.md), [второго этапа](docs/STAGE_2_TEST_REPORT.md) и [третьего этапа](docs/STAGE_3_TEST_REPORT.md).
+Результаты проверок сохранены в отчётах [первого этапа](docs/TEST_REPORT.md), [второго этапа](docs/STAGE_2_TEST_REPORT.md), [третьего этапа](docs/STAGE_3_TEST_REPORT.md) и [четвёртого этапа](docs/STAGE_4_TEST_REPORT.md).
 
 ## Локальный PostgreSQL 16
 
@@ -95,6 +97,8 @@ uv run --locked python -m pytest --integration
    ```
 
    Заполните `POSTGRES_PASSWORD` собственным паролем. `POSTGRES_DB` и `POSTGRES_USER` задают имя базы и пользователя. Для Python на хосте используются `POSTGRES_HOST=127.0.0.1` и `POSTGRES_PORT=5432`. Если порт занят, задайте в `.env` свободный порт, например `5433`.
+
+   Для AI-команд также заполните `GROQ_API_KEY` в локальном `.env`. В шаблоне уже указаны модель и лимиты. [Настройки Groq](docs/LLM.md#настройка)
 
 2. Проверьте конфигурацию, запустите PostgreSQL и дождитесь готовности.
 
@@ -267,6 +271,27 @@ uv run --locked python -m scripts.sales_report --start-date 2026-07-01 --end-dat
 
 При сравнении команда возвращает два отчёта, `current` и `comparison`. Каждый рассчитывается по своему периоду и срезу с одинаковыми фильтрами. Формулы приведены в [справочнике KPI](docs/KPI_DEFINITIONS.md).
 
+## AI-команды GroqCloud
+
+В PowerShell создайте файл с синтетическим комментарием. Команда `classify` принимает массив строк, а `evaluate` читает файл с эталонными метками. Для оценки по умолчанию используется основной набор и партии по два комментария. Каждая команда ниже обращается к GroqCloud и расходует квоту.
+
+```powershell
+New-Item -ItemType Directory -Force data/local | Out-Null
+'["Банк отказал в рассрочке."]' | Set-Content -Encoding utf8 data/local/demo_comments.json
+uv run --locked python -m scripts.ai_sales classify data/local/demo_comments.json
+uv run --locked python -m scripts.ai_sales evaluate
+uv run --locked python -m scripts.ai_sales evaluate data/synthetic/ai/rejection_challenge_cases.json --batch-size 2
+```
+
+После импорта стандартного набора сохраните SQL-отчёт и используйте его в обеих командах аналитики. [Подготовка данных и интерпретация ответов](docs/AI_ANALYSIS.md)
+
+```powershell
+uv run --locked python -m scripts.sales_report --start-date 2026-06-01 --end-date 2026-08-31 --cutoff-date 2026-10-31 |
+  Set-Content -Encoding utf8 data/local/sales_report.json
+uv run --locked python -m scripts.ai_sales summarize data/local/sales_report.json
+uv run --locked python -m scripts.ai_sales ask data/local/sales_report.json 'Какой источник принёс больше всего денег?'
+```
+
 ## Дашборд Streamlit
 
 Поднимите PostgreSQL, примените миграции и [импортируйте стандартный набор](#импорт-csv-и-excel). Оставьте FastAPI запущенным на `127.0.0.1:8000`. Во втором терминале из корня проекта выполните команду.
@@ -296,3 +321,6 @@ uv run --locked python -m streamlit run dashboard/main.py --server.address 127.0
 - [Технические решения](docs/DECISIONS.md)
 - [История изменений](docs/CHANGELOG.md)
 - [Отчёт о проверке второго этапа](docs/STAGE_2_TEST_REPORT.md)
+- [Настройка и проверка LLM-клиента](docs/LLM.md)
+- [AI-аналитика и примеры команд](docs/AI_ANALYSIS.md)
+- [Итоги приёмки этапа 4](docs/STAGE_4_TEST_REPORT.md#stage-4-acceptance)
