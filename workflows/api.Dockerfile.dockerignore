@@ -1,0 +1,11 @@
+**
+!pyproject.toml
+!uv.lock
+!app/
+!app/**/
+!app/**/*.py
+!sql/
+!sql/queries/
+!sql/queries/sales_report.sql
+!workflows/
+!workflows/report_api.py

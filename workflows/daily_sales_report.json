@@ -1,0 +1,255 @@
+{
+  "name": "EduFlow — Daily Sales Report",
+  "id": "EduFlowDailySales1",
+  "active": false,
+  "nodes": [
+    {
+      "parameters": {},
+      "id": "ab56c52b-9efa-48d0-82e0-bb7ee8d00d2c",
+      "name": "Manual demo",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        0,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 9 * * *"
+            }
+          ]
+        }
+      },
+      "id": "aafe928b-9efa-48d0-82e0-bb7ee8d00d2c",
+      "name": "Daily 09:00",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        0,
+        190
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Optional filters use a prepared source code and/or a manager UUID.\nconst source = null;\nconst manager_id = null;\nconst query = {start_date: '2026-06-01', end_date: '2026-08-31', cutoff_date: '2026-10-31'};\nif ($('Daily 09:00').isExecuted) {\n  const trigger = DateTime.fromISO($input.first().json.timestamp, {setZone: true});\n  if (!trigger.isValid) throw new Error('Invalid schedule timestamp');\n  const day = trigger.setZone('Europe/Moscow').minus({days: 1}).toISODate();\n  Object.assign(query, {start_date: day, end_date: day, cutoff_date: day});\n}\nif (source !== null) query.source = source;\nif (manager_id !== null) query.manager_id = manager_id;\nreturn [{json: query}];"
+      },
+      "id": "a678355b-9efa-48d0-82e0-bb7ee8d00d2c",
+      "name": "Report period",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        240,
+        80
+      ]
+    },
+    {
+      "parameters": {
+        "url": "http://report-api:8000/api/v1/metrics",
+        "sendQuery": true,
+        "specifyQuery": "json",
+        "jsonQuery": "={{ JSON.stringify($('Report period').first().json) }}",
+        "options": {
+          "redirect": {
+            "redirect": {
+              "followRedirects": false
+            }
+          },
+          "timeout": 5000,
+          "response": {
+            "response": {
+              "fullResponse": true,
+              "neverError": true,
+              "responseFormat": "text",
+              "outputPropertyName": "body"
+            }
+          }
+        }
+      },
+      "id": "b7e460cb-9efa-48d0-82e0-bb7ee8d00d2c",
+      "name": "Fetch SQL metrics",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        480,
+        80
+      ],
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "const response = $input.first().json;\nconst status = response.statusCode;\nconst attempt = $runIndex + 1;\nconst transportFailure = status === undefined && Boolean(response.error);\nconst temporary = transportFailure || [408, 429, 500, 502, 503, 504].includes(status);\nif (temporary && attempt < 3) return [{json: {retry: true}}];\nif (transportFailure) throw new Error('Metrics API unavailable or timed out (3 attempts)');\nif (status !== 200) throw new Error('Metrics API HTTP ' + (Number.isInteger(status) ? status : 'unknown'));\n\nlet report;\ntry {\n  report = JSON.parse(response.body);\n} catch {\n  throw new Error('Metrics API returned invalid JSON');\n}\nconst query = $('Report period').first().json;\nif (!report || !['start_date', 'end_date', 'cutoff_date'].every(k => report.period?.[k] === query[k])) {\n  throw new Error('Metrics API returned an unexpected report period');\n}\nfunction decimal(value) {\n  return typeof value === 'string' && /^\\d+(?:\\.\\d{1,2})?$/.test(value);\n}\nfunction kpis(row) {\n  if (!row || !decimal(row.paid_amount_rub) || !Number.isSafeInteger(row.paying_leads) || row.paying_leads < 0\n      || !(row.average_paid_check_rub === null || decimal(row.average_paid_check_rub))\n      || !(row.lesson_to_payment_pct === null || (decimal(row.lesson_to_payment_pct) && Number(row.lesson_to_payment_pct) <= 100))) {\n    throw new Error('Metrics API returned missing or invalid KPI fields');\n  }\n  return {paid_amount_rub: row.paid_amount_rub, paying_leads: row.paying_leads,\n    average_paid_check_rub: row.average_paid_check_rub, lesson_to_payment_pct: row.lesson_to_payment_pct};\n}\nfunction breakdown(rows, key) {\n  if (rows === undefined) return [];\n  if (!Array.isArray(rows)) throw new Error('Invalid breakdown');\n  return rows.map(row => {\n    if (typeof row?.[key] !== 'string' || !row[key].trim()) throw new Error('Missing breakdown label');\n    return {[key]: row[key], ...kpis(row)};\n  });\n}\nconst result = {report_id: JSON.stringify([query.start_date, query.end_date, query.cutoff_date, query.source ?? null, query.manager_id ?? null]),\n  period: report.period, filters: {source: query.source ?? null, manager_id: query.manager_id ?? null}, total: kpis(report.total)};\nfor (const [field, key] of [['by_source', 'source'], ['by_manager', 'manager_id']]) {\n  const rows = breakdown(report[field], key);\n  if (rows.length) result[field] = rows;\n}\nreturn [{json: {retry: false, report: result}}];"
+      },
+      "id": "ed2db05c-9efa-48d0-82e0-bb7ee8d00d2c",
+      "name": "Validate response",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        720,
+        80
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "348c9136-d5c5-46eb-a628-fb8f0a38c16d",
+              "leftValue": "={{ $json.retry }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "d7a3f0ee-9efa-48d0-82e0-bb7ee8d00d2c",
+      "name": "Retry?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        960,
+        80
+      ]
+    },
+    {
+      "parameters": {
+        "amount": 2,
+        "unit": "seconds"
+      },
+      "id": "d92dbb07-9efa-48d0-82e0-bb7ee8d00d2c",
+      "name": "Backoff",
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1.1,
+      "position": [
+        960,
+        -130
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const report = $input.first().json.report;\nfunction display(value, unit) {\n  if (value === null) return 'нет данных';\n  const [whole, fraction = ''] = value.split('.');\n  return whole.replace(/\\B(?=(\\d{3})+(?!\\d))/g, ' ') + ',' + fraction.padEnd(2, '0') + ' ' + unit;\n}\nconst {start_date, end_date, cutoff_date} = report.period;\nconst t = report.total;\nconst lines = [\n  'Продажи за ' + start_date + ' — ' + end_date + ' (срез ' + cutoff_date + ')',\n  'Сумма успешных оплат — ' + display(t.paid_amount_rub, '₽'),\n  'Оплатившие лиды — ' + t.paying_leads,\n  'Средний оплаченный чек — ' + display(t.average_paid_check_rub, '₽'),\n  'Конверсия из урока в оплату — ' + display(t.lesson_to_payment_pct, '%')\n];\nreturn [{json: {...report, text: lines.join('\\n')}}];"
+      },
+      "id": "ffabc078-9efa-48d0-82e0-bb7ee8d00d2c",
+      "name": "Daily sales report",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1190,
+        180
+      ]
+    }
+  ],
+  "connections": {
+    "Manual demo": {
+      "main": [
+        [
+          {
+            "node": "Report period",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Daily 09:00": {
+      "main": [
+        [
+          {
+            "node": "Report period",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Report period": {
+      "main": [
+        [
+          {
+            "node": "Fetch SQL metrics",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch SQL metrics": {
+      "main": [
+        [
+          {
+            "node": "Validate response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validate response": {
+      "main": [
+        [
+          {
+            "node": "Retry?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Retry?": {
+      "main": [
+        [
+          {
+            "node": "Backoff",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Daily sales report",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Backoff": {
+      "main": [
+        [
+          {
+            "node": "Fetch SQL metrics",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "timezone": "Europe/Moscow",
+    "saveDataSuccessExecution": "all",
+    "saveDataErrorExecution": "all",
+    "saveManualExecutions": true,
+    "saveExecutionProgress": false,
+    "executionTimeout": 60
+  },
+  "versionId": "ccd11670-cd7c-462a-90bd-f9556b9c1442",
+  "pinData": {}
+}
