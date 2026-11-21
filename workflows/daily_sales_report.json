@@ -153,6 +153,136 @@
         1190,
         180
       ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Enable these independently after binding EduFlow Telegram and checking the private recipient.\nconst sendManual = false;\nconst sendScheduled = false;\nconst scheduled = $('Daily 09:00').isExecuted;\nconst report = $input.first().json;\nconst t = report.total;\nconst decimal = v => typeof v === 'string' && /^\\d+(?:\\.\\d{1,2})?$/.test(v);\nif (!t || !decimal(t.paid_amount_rub) || !Number.isSafeInteger(t.paying_leads) || t.paying_leads < 0 ||\n    !(t.average_paid_check_rub === null || decimal(t.average_paid_check_rub)) ||\n    !(t.lesson_to_payment_pct === null || decimal(t.lesson_to_payment_pct))) {\n  throw new Error('Telegram report contains invalid KPIs');\n}\nconst text = ['📊 EduFlow AI | Отчёт по продажам', report.text, '✅ Отчёт сформирован автоматически'].join('\\n\\n');\nif (!report.text || text.length > 4096 || /\\b(?:null|NaN|Infinity|undefined)\\b/.test(text)) {\n  throw new Error('Telegram report text is invalid');\n}\nreturn [{json: {enabled: scheduled ? sendScheduled : sendManual, period: report.period,\n  report_id: report.report_id, execution_id: String($execution.id), started_at: $now.toISO(), text}}];"
+      },
+      "id": "7937d9a0-3915-42c8-b98d-8bba4bdd67d0",
+      "name": "Prepare Telegram delivery",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1420,
+        180
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "d7e932d2-983a-459f-9a6b-68045a2b71dd",
+              "leftValue": "={{ $json.enabled }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "7937d9a1-3915-42c8-b98d-8bba4bdd67d0",
+      "name": "Send enabled?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1650,
+        180
+      ]
+    },
+    {
+      "parameters": {
+        "resource": "message",
+        "operation": "sendMessage",
+        "chatId": "={{ JSON.stringify({kind:'eduflow-report', execution_id:$json.execution_id, report_id:$json.report_id}) }}",
+        "text": "={{ $json.text }}",
+        "additionalFields": {
+          "appendAttribution": false,
+          "disable_web_page_preview": true
+        }
+      },
+      "id": "7937d9a2-3915-42c8-b98d-8bba4bdd67d0",
+      "name": "Telegram Send Message",
+      "disabled": true,
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        1880,
+        50
+      ],
+      "onError": "continueRegularOutput",
+      "retryOnFail": false
+    },
+    {
+      "parameters": {
+        "jsCode": "const request = $('Prepare Telegram delivery').first().json;\nconst input = $input.first().json;\nconst delivery = input.delivery;\nconst record = {started_at: request.started_at, execution_id: request.execution_id, period: request.period,\n  status: 'skipped', attempts: 0, attempt_log: [], message_id: null, error_code: null};\nif (!request.enabled) return [{json: record}];\nif (!delivery || delivery.execution_id !== request.execution_id ||\n    !['sent', 'already_sent', 'failed', 'unknown'].includes(delivery.status) ||\n    !Number.isInteger(delivery.attempts) || !Array.isArray(delivery.attempt_log) ||\n    delivery.attempts !== delivery.attempt_log.length ||\n    (['sent', 'already_sent'].includes(delivery.status) && !(Number.isSafeInteger(delivery.message_id) && delivery.message_id > 0))) {\n  return [{json: {...record, status: 'unknown', attempts: null, error_code: 'delivery_confirmation_missing'}}];\n}\nreturn [{json: {...record, status: delivery.status, attempts: delivery.attempts,\n  attempt_log: delivery.attempt_log, message_id: delivery.message_id, error_code: delivery.error_code}}];"
+      },
+      "id": "7937d9a3-3915-42c8-b98d-8bba4bdd67d0",
+      "name": "Delivery receipt",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2130,
+        180
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "d7e932d2-983a-459f-9a6b-68045a2b71dd",
+              "leftValue": "={{ ['failed','unknown'].includes($json.status) }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "7937d9a4-3915-42c8-b98d-8bba4bdd67d0",
+      "name": "Delivery failed?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        2360,
+        180
+      ]
+    },
+    {
+      "parameters": {
+        "errorMessage": "={{ 'Telegram: ' + $json.error_code }}"
+      },
+      "id": "7937d9a5-3915-42c8-b98d-8bba4bdd67d0",
+      "name": "Delivery error",
+      "type": "n8n-nodes-base.stopAndError",
+      "typeVersion": 1,
+      "position": [
+        2580,
+        55
+      ]
     }
   ],
   "connections": {
@@ -239,6 +369,79 @@
           }
         ]
       ]
+    },
+    "Daily sales report": {
+      "main": [
+        [
+          {
+            "node": "Prepare Telegram delivery",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare Telegram delivery": {
+      "main": [
+        [
+          {
+            "node": "Send enabled?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send enabled?": {
+      "main": [
+        [
+          {
+            "node": "Telegram Send Message",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Delivery receipt",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Telegram Send Message": {
+      "main": [
+        [
+          {
+            "node": "Delivery receipt",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Delivery receipt": {
+      "main": [
+        [
+          {
+            "node": "Delivery failed?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Delivery failed?": {
+      "main": [
+        [
+          {
+            "node": "Delivery error",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
     }
   },
   "settings": {
@@ -248,8 +451,8 @@
     "saveDataErrorExecution": "all",
     "saveManualExecutions": true,
     "saveExecutionProgress": false,
-    "executionTimeout": 60
+    "executionTimeout": 120
   },
-  "versionId": "ccd11670-cd7c-462a-90bd-f9556b9c1442",
+  "versionId": "9509ab20-0f9f-4fda-9a24-6ba2c5663f07",
   "pinData": {}
 }

@@ -48,8 +48,28 @@ services:
     networks: [reports]
     restart: unless-stopped
 
+  telegram-delivery:
+    image: n8nio/n8n:2.48.7
+    entrypoint: ["node", "/opt/eduflow/telegram/server.mjs"]
+    network_mode: "service:n8n"
+    depends_on:
+      n8n:
+        condition: service_healthy
+    environment:
+      EDUFLOW_TELEGRAM_CHAT_ID: ${EDUFLOW_TELEGRAM_CHAT_ID:-}
+    volumes:
+      - ./workflows/telegram:/opt/eduflow/telegram:ro
+      - telegram_delivery_data:/home/node/.n8n
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:5687/healthz').then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
 networks:
   reports: {}
 
 volumes:
   n8n_data:
+  telegram_delivery_data:
