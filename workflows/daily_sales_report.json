@@ -36,7 +36,7 @@
     },
     {
       "parameters": {
-        "jsCode": "// Optional filters use a prepared source code and/or a manager UUID.\nconst source = null;\nconst manager_id = null;\nconst query = {start_date: '2026-06-01', end_date: '2026-08-31', cutoff_date: '2026-10-31'};\nif ($('Daily 09:00').isExecuted) {\n  const trigger = DateTime.fromISO($input.first().json.timestamp, {setZone: true});\n  if (!trigger.isValid) throw new Error('Invalid schedule timestamp');\n  const day = trigger.setZone('Europe/Moscow').minus({days: 1}).toISODate();\n  Object.assign(query, {start_date: day, end_date: day, cutoff_date: day});\n}\nif (source !== null) query.source = source;\nif (manager_id !== null) query.manager_id = manager_id;\nreturn [{json: query}];"
+        "jsCode": "// Optional filters use a prepared source code and/or a manager UUID.\nconst source = null;\nconst manager_id = null;\nconst query = {start_date: '2026-06-01', end_date: '2026-08-31', cutoff_date: '2026-10-31'};\nif ($('Daily 09:00').isExecuted) {\n  if ($now.zoneName !== 'Europe/Moscow') throw new Error('Workflow timezone must be Europe/Moscow');\n  const trigger = DateTime.fromISO($input.first().json.timestamp, {setZone: true});\n  if (!trigger.isValid) throw new Error('Invalid schedule timestamp');\n  const day = trigger.setZone('Europe/Moscow').minus({days: 1}).toISODate();\n  Object.assign(query, {start_date: day, end_date: day, cutoff_date: day});\n}\nif (source !== null) query.source = source;\nif (manager_id !== null) query.manager_id = manager_id;\nreturn [{json: query}];"
       },
       "id": "a678355b-9efa-48d0-82e0-bb7ee8d00d2c",
       "name": "Report period",
@@ -453,6 +453,6 @@
     "saveExecutionProgress": false,
     "executionTimeout": 120
   },
-  "versionId": "9509ab20-0f9f-4fda-9a24-6ba2c5663f07",
+  "versionId": "9dd79275-cc87-45d2-8937-75bbf410e5a9",
   "pinData": {}
 }

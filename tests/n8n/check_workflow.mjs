@@ -60,6 +60,9 @@ function variant(name) {
 }
 const timer = variant('timer');
 node(timer, 'Daily 09:00').parameters.rule.interval[0].expression = '*/10 * * * * *';
+const wrongZone = variant('wrongZone');
+wrongZone.settings.timezone = 'UTC';
+node(wrongZone, 'Daily 09:00').parameters.rule.interval[0].expression = '*/10 * * * * *';
 const filtered = variant('filtered');
 const filterSettings = node(filtered, 'Report period').parameters;
 filterSettings.jsCode = filterSettings.jsCode.replace('const source = null;', "const source = 'organic_search';");
@@ -97,7 +100,7 @@ async function execution(id, expectedError) {
 let server;
 try {
   const input = home + '/workflows.json';
-  await writeFile(input, JSON.stringify([original, timer, filtered, ...fixtures]));
+  await writeFile(input, JSON.stringify([original, timer, wrongZone, filtered, ...fixtures]));
   await cli('import:workflow', '--input=' + input);
   const first = (await execution(original.id)).report;
   const repeat = (await execution(original.id)).report;
@@ -126,17 +129,26 @@ try {
   }
 
   await cli('publish:workflow', '--id=' + timer.id);
+  await cli('publish:workflow', '--id=' + wrongZone.id);
   server = spawn('n8n', ['start'], {env, stdio:'ignore'});
   const db = new DatabaseSync(home + '/.n8n/database.sqlite', {readOnly:true});
   try {
     const latest = db.prepare("SELECT e.status, e.startedAt, d.data FROM execution_entity e LEFT JOIN execution_data d ON d.executionId=e.id WHERE e.workflowId=? AND e.mode='trigger' ORDER BY e.id DESC LIMIT 1");
-    let row;
+    let row, rejected;
     for (let i=0; i<75; i++) {
       row = latest.get(timer.id);
-      if (row?.status === 'success' || row?.status === 'error') break;
+      rejected = latest.get(wrongZone.id);
+      if ([row, rejected].every(r => ['success', 'error'].includes(r?.status))) break;
       await delay(1000);
     }
     assert.equal(row?.status, 'success', 'published Schedule Trigger');
+    assert.equal(rejected?.status, 'error', 'wrong workflow timezone');
+    const failure = JSON.parse(rejected.data);
+    assert.ok(failure.some(v => typeof v === 'string' && v.includes('Workflow timezone must be Europe/Moscow')));
+    const nodesRun = failure[failure[failure[0].resultData].runData];
+    assert.ok(nodesRun['Report period']);
+    assert.ok(!nodesRun['Fetch SQL metrics'] && !nodesRun['Telegram Send Message']);
+    console.log('PASS wrong timezone stops trigger before SQL or delivery');
     // n8n serializes runData as a flatted value table. Inspect the final node.
     const table = JSON.parse(row.data);
     function at(value, ...path) {
