@@ -17,7 +17,7 @@ uv run --locked python -m scripts.generate_synthetic_data
 uv run --locked python -m scripts.import_sales_data data/synthetic/generated --source-system synthetic_42
 ```
 
-Ожидаются миграция `0002 (head)`, 500 лидов, 8 менеджеров, 481 урок, 209 банковских заявок и 196 оплат. Повтор импорта тех же файлов с тем же `source-system` распознаёт дубликаты. [Контракт импорта](../README.md#импорт-csv-и-excel)
+Ожидаются миграция `0002 (head)`, 500 лидов, 8 менеджеров, 481 урок, 209 банковских заявок и 196 оплат. Повтор импорта тех же файлов с тем же `source-system` распознаёт дубликаты. [Контракт импорта](DATA_IMPORT.md#импорт-csv-и-excel)
 
 ## 2. Запустить API, интерфейс и n8n
 
@@ -56,3 +56,58 @@ uv run --locked python -m scripts.smoke_stage6 --expect-leads 500
 ## Изолированный повтор развёртывания
 
 Для репетиции используйте отдельную чистую копию, собственный `.env` из примера, свободные порты и отдельное имя Compose. Например, задайте `POSTGRES_PORT=55461`, `N8N_LOCAL_PORT=15671` и в начале команд используйте `$compose = @('-p','eduflow-s6-demo','-f','docker-compose.yml','-f','compose.n8n.yaml')`. Во всех терминалах запускайте Python из этой копии. Для API задайте `--port 18061`, для Streamlit — `--server.port 18561` и перед его запуском `$env:EDUFLOW_API_URL='http://127.0.0.1:18061'`. Передайте новые адреса в smoke-команду. Обычный перезапуск проверяется командой `docker compose @compose restart`, затем `docker compose @compose up -d --wait telegram-delivery` и повтором smoke. Для остановки используйте `docker compose @compose stop`. Именованные тома сохраняются.
+
+## Локальный PostgreSQL 16
+
+Docker публикует порт базы на `127.0.0.1` и сохраняет именованный том при обычной остановке. Для занятого порта задайте в `.env` свободный `POSTGRES_PORT`. Имя базы, пользователь и пароль применяются при первой инициализации пустого тома. Для существующего тома используйте его реквизиты.
+
+```powershell
+docker compose config --quiet
+docker compose ps postgres
+docker compose logs --tail 40 postgres
+uv run --locked python -m scripts.check_db
+```
+
+## Миграции базы данных
+
+Запустите PostgreSQL и выполните `uv sync --locked`. Для просмотра SQL всех миграций от пустой схемы выполните команду ниже. Alembic выведет SQL в терминал в автономном режиме. [Генерация SQL в Alembic](https://alembic.sqlalchemy.org/en/latest/offline.html)
+
+```powershell
+uv run --locked alembic upgrade head --sql
+```
+
+Примените миграции к локальной базе из `.env` и проверьте результат.
+
+```powershell
+uv run --locked alembic upgrade head
+uv run --locked alembic current
+uv run --locked alembic check
+```
+
+Ожидаются ревизия `0002 (head)` и сообщение `No new upgrade operations detected.` Alembic записывает номер применённой ревизии в таблицу `alembic_version`. Правила предметной области проверяются ограничениями PostgreSQL.
+
+### Проверка отката
+
+В PowerShell создайте отдельную временную базу. В примере откатывается её схема, а в конце удаляется только эта временная база.
+
+```powershell
+$testDb = 'eduflow_migration_' + [Guid]::NewGuid().ToString('N')
+docker compose exec -T postgres sh -c 'createdb -U "$POSTGRES_USER" -- "$1"' sh $testDb
+if ($LASTEXITCODE -ne 0) { throw 'Не удалось создать тестовую базу.' }
+
+$previousDb = $env:POSTGRES_DB
+try {
+    $env:POSTGRES_DB = $testDb
+    uv run --locked alembic upgrade head
+    if ($LASTEXITCODE -ne 0) { throw 'Применение миграций завершилось ошибкой.' }
+    uv run --locked alembic downgrade base
+    if ($LASTEXITCODE -ne 0) { throw 'Откат завершился ошибкой.' }
+    uv run --locked alembic upgrade head
+    if ($LASTEXITCODE -ne 0) { throw 'Повторная миграция завершилась ошибкой.' }
+    uv run --locked alembic check
+    if ($LASTEXITCODE -ne 0) { throw 'Схема требует проверки.' }
+} finally {
+    $env:POSTGRES_DB = $previousDb
+    docker compose exec -T postgres sh -c 'dropdb -U "$POSTGRES_USER" -- "$1"' sh $testDb
+}
+```

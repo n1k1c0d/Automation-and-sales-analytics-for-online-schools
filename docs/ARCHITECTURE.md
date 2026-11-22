@@ -1,41 +1,30 @@
 # Архитектура EduFlow AI
 
-Диаграмма показывает целевое взаимодействие модулей первой версии. Uvicorn запускает приложение из `app/main.py`. FastAPI принимает файлы через `POST /api/v1/import` и отдаёт отчёты через `GET /api/v1/metrics`. [Контракт HTTP-маршрутов](API.md)
+Стрелки показывают передачу данных. На хосте запускаются основной FastAPI, Streamlit, CLI и миграции. Внутри Compose у n8n есть отдельный HTTP-маршрут для чтения KPI. Оба приложения FastAPI вызывают один обработчик отчёта. [Контракт API](API.md) · [Развёртывание](DEPLOYMENT.md)
 
 ```mermaid
-flowchart LR
-    Files["CSV / Excel"]
-    Clients["Клиенты REST API"]
-    Dashboard["Дашборд Streamlit"]
-    Workflow["Планировщик n8n"]
-    Telegram["Telegram"]
-    Provider["LLM API"]
-
-    subgraph Backend["Backend EduFlow AI"]
-        API["FastAPI и Pydantic"]
-        Services["Сервисы и валидация импорта"]
-        Analytics["Расчёт KPI"]
-        AI["Классификация и сводки"]
-        Data["SQLAlchemy и psycopg"]
+flowchart TD
+    files["CSV / Excel"] --> ingest["Импорт через CLI или FastAPI"]
+    ingest --> orm["SQLAlchemy · psycopg"]
+    migration["Alembic"] -->|миграции| pg
+    orm -->|запись| pg
+    subgraph compose["Docker Compose"]
+        pg[("PostgreSQL 16")]
+        api["FastAPI report-api · только чтение"]
+        n8n["n8n · расписание и ручной запуск"]
+        relay["Telegram relay · журнал SQLite"]
+        api -->|KPI| n8n
+        n8n -->|отчёт для доставки| relay
     end
-
-    DB[("PostgreSQL")]
-    Alembic["Миграции Alembic"]
-
-    Files --> Services
-    Clients --> API
-    Dashboard --> API
-    Workflow --> API
-    Workflow --> Telegram
-    API --> Services
-    API --> Analytics
-    API --> AI
-    Services --> Data
-    Analytics --> Data
-    AI --> Analytics
-    AI <--> Provider
-    Data <--> DB
-    Alembic --> DB
+    pg -->|события и когорта| sql["Общий SQL-отчёт"]
+    sql --> api
+    sql --> rest["FastAPI · локальный API"]
+    rest -->|KPI и справочники| ui["Streamlit"]
+    sql --> cli["CLI sales_report · JSON"]
+    cli --> ai["AI CLI · Pydantic и бизнес-проверки"]
+    comments["Обезличенные комментарии"] --> ai
+    ai <-->|план или классификация| groq["GroqCloud · Qwen"]
+    relay -->|sendMessage| tg["Telegram Bot API"]
 ```
 
 ## Ответственность модулей
@@ -58,7 +47,7 @@ flowchart LR
 1. Генератор создаёт связанные CSV. CLI и API передают CSV и Excel общему сервису импорта. HTTP-обработчик сохраняет загруженные файлы во временную папку на время запроса. Сервис проверяет заголовки и поля, определяет родительские записи по внешним ID и сохраняет допустимые строки в PostgreSQL. JSON-отчёт содержит счётчики и причины отказа с номерами строк.
 2. Слой аналитики принимает даты, срез и фильтры и возвращает итог и разбивки одним SQL-запросом. API и `scripts/sales_report.py` используют один расчёт и формат отчёта. Streamlit получает текущий и сравнительный отчёты по HTTP, строит графики Altair и показывает таблицы. Справочники менеджеров и каналов загружаются по отдельному маршруту из всей базы. Модели отчёта общие для FastAPI и Streamlit. [Контракт API](API.md), [графики Altair в Streamlit](https://docs.streamlit.io/develop/api-reference/charts/st.altair_chart)
 3. Единый клиент LLM отправляет текст и схему ответа в Groq Chat Completions. Сервис отказов проверяет комментарии на признаки персональных данных до отправки, затем проверяет дословные цитаты и подсчитывает категории. Для сводок и вопросов модель выбирает ссылки на агрегаты, а сервис берёт значения из SQL-отчёта и вычисляет сравнения. Команды доступны через CLI. [Контракт клиента](LLM.md), [сценарии AI-аналитики](AI_ANALYSIS.md)
-4. Сценарий n8n запускается по расписанию, вызывает API для сбора отчёта и отправляет результат через Telegram Bot API. Ошибки выполнения регистрируются для диагностики.
+4. В 09:00 МСК n8n запрашивает у внутреннего FastAPI показатели за предыдущий день, проверяет ответ и собирает текст. При разрешённой отправке штатный узел Telegram обращается к локальному relay. Тот резервирует запись в SQLite, сверяет получателя и сохраняет подтверждённый идентификатор сообщения. n8n показывает квитанцию в Executions. При неопределённом исходе оператор проверяет доставку вручную. [Workflow](STAGE_5_N8N.md) · [Доставка и состояния](STAGE_5_TELEGRAM.md)
 
 Генератор в `scripts/generate_synthetic_data.py` формирует пять связанных CSV. Он использует отдельный генератор случайных чисел с заданным `seed` и рассчитывает стабильные UUID из внешних идентификаторов. Сервис импорта определяет идентичность строки по паре `source_system` и `external_id`. PostgreSQL назначает UUID новым строкам. Родительские строки импортируются раньше дочерних. Уникальное ограничение защищает от дубликатов, а точка сохранения позволяет отклонить одну строку и продолжить обработку.
 
@@ -71,7 +60,7 @@ SQL в `sql/queries/sales_report.sql` объединяет строки собы
 - `create_db_engine` в `app/database/connection.py` собирает параметры подключения через SQLAlchemy `URL.create`. Движок использует psycopg 3 и проверяет соединения из пула перед использованием. FastAPI создаёт этот пул при запуске приложения, а соединение открывается при первом обращении к базе.
 - `python -m scripts.check_db` выполняет запрос через настоящее подключение. `GET /health` служит проверкой процесса API. Материалы для запуска и диагностики собраны в [README](../README.md).
 - Структуру пяти таблиц, связи и ограничения для первой миграции задаёт [модель данных](DATA_MODEL.md).
-- Модели SQLAlchemy используют общую `Base.metadata`. Alembic сравнивает метаданные с PostgreSQL и применяет версионированные миграции. При запуске API схема управляется отдельно через команды из [README](../README.md#миграции-базы-данных). [Сравнение схем в Alembic](https://alembic.sqlalchemy.org/en/latest/autogenerate.html)
+- Модели SQLAlchemy используют общую `Base.metadata`. Alembic сравнивает метаданные с PostgreSQL и применяет версионированные миграции. При запуске API схема управляется отдельно через команды из [руководства по миграциям](DEPLOYMENT.md#миграции-базы-данных). [Сравнение схем в Alembic](https://alembic.sqlalchemy.org/en/latest/autogenerate.html)
 
 ## Границы и развитие
 

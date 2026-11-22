@@ -4,7 +4,7 @@
 
 ## Первый запуск
 
-Выполняйте команды из корня проекта в PowerShell. Нужны Docker Compose, uv и локальный `.env` с параметрами PostgreSQL. При первом запуске скопируйте `.env.example` в `.env` и заполните `POSTGRES_PASSWORD`. Для этой автоматизации достаточно параметров PostgreSQL и, при необходимости, `N8N_LOCAL_PORT`. [Настройка PostgreSQL](../README.md#локальный-postgresql-16)
+Выполняйте команды из корня проекта в PowerShell. Нужны Docker Compose, uv и локальный `.env` с параметрами PostgreSQL. При первом запуске скопируйте `.env.example` в `.env` и заполните `POSTGRES_PASSWORD`. Для этой автоматизации достаточно параметров PostgreSQL и, при необходимости, `N8N_LOCAL_PORT`. [Настройка PostgreSQL](DEPLOYMENT.md#локальный-postgresql-16)
 
 ```powershell
 $compose = @('-f', 'docker-compose.yml', '-f', 'compose.n8n.yaml')
