@@ -41,6 +41,10 @@ uv run --locked python -m streamlit run dashboard/main.py --server.address 127.0
 
 Токен Telegram вводится в Credentials n8n. На новом экземпляре создайте Telegram API credential, задайте локальный Base URL `http://127.0.0.1:5687`, привяжите credential к узлу и настройте один разрешённый личный чат. Для восстановления существующего экземпляра сохраните том `n8n_data` с соответствующим ключом шифрования и отдельный `telegram_delivery_data` с журналом доставок. Потеря последнего снимает защиту от повторной отправки старого отчёта. [Пошаговая настройка и ручное подтверждение](STAGE_5_TELEGRAM.md)
 
+Для ежедневной доставки настройте `EDUFLOW_TELEGRAM_CHAT_ID` в локальном `.env` и примените его командой `docker compose @compose up -d --wait telegram-delivery`. В редакторе включите **Telegram Send Message** с подготовленными Credentials. В **Prepare Telegram delivery** установите `sendScheduled = true`, проверьте у **Daily 09:00** cron `0 9 * * *` и в настройках workflow часовой пояс `Europe/Moscow`. Нажмите **Publish**. Ручная отправка управляется отдельным флагом `sendManual`.
+
+После срабатывания откройте **Executions → Delivery receipt** и сверьте отчёт за предыдущий московский день с сообщением в чате. Для первой успешной отправки ожидайте `sent` и положительный `message_id`, для повтора уже доставленного отчёта — `already_sent` и ноль новых попыток. [Проверка на рабочем боте](STAGE_5_TEST_REPORT.md#подтверждение-доставки-по-расписанию)
+
 ## 3. Проверить готовность
 
 В третьем терминале выполните:
