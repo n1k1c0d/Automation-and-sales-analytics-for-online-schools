@@ -27,7 +27,7 @@
 
 ## Повтор проверки
 
-Запустите PostgreSQL и подготовьте `.env` по [инструкции проекта](../README.md#локальный-postgresql-16). Выполните команды из корня проекта.
+Запустите PostgreSQL и подготовьте `.env` по [инструкции проекта](DEPLOYMENT.md#локальный-postgresql-16). Выполните команды из корня проекта.
 
 ```powershell
 uv sync --locked
@@ -40,7 +40,7 @@ uv run --locked ruff format --check .
 uv run --locked python -m pytest --integration -q -ra -W error
 ```
 
-Для ручной проверки загрузите [стандартный набор](../README.md#импорт-csv-и-excel) и запустите API.
+Для ручной проверки загрузите [стандартный набор](DATA_IMPORT.md#импорт-csv-и-excel) и запустите API.
 
 ```powershell
 uv run --locked python -m uvicorn app.main:app --host 127.0.0.1 --port 18033
